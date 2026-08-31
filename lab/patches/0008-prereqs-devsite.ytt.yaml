@@ -1,0 +1,26 @@
+#! target: helm-prereqs/values.yaml
+#! Devsite prereqs, the site name plus dev UEFI creds and a single postgres.
+#@ load("@ytt:overlay", "overlay")
+
+#@overlay/match by=overlay.all
+---
+siteName: devenv
+vault:
+  kvSeeds:
+    #@overlay/match by="path"
+    - path: machines/all_dpus/site_default/uefi-metadata-items/auth
+      data:
+        UsernamePassword:
+          username: admin
+          password: devenv
+    #@overlay/match by="path"
+    - path: machines/all_hosts/site_default/uefi-metadata-items/auth
+      data:
+        UsernamePassword:
+          username: admin
+          password: devenv
+#! Patroni strict sync blocks every write on a single instance, including the
+#! operator's own CREATE DATABASE, so sync mode goes off with the replica count.
+postgresql:
+  instances: 1
+  synchronousMode: false

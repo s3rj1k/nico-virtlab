@@ -1,0 +1,737 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# Prepares this host and builds the NICo images from the infra-controller submodule
+# of the repo this playbook lives in. Nothing is cloned. The submodule is reset to
+# its pinned commit, then every lab patch is applied and committed as one WIP commit
+# on top, so the build compiles a clean, named tree.
+#
+#   ansible-playbook lab/ansible/build.yml -K
+#   ansible-playbook lab/ansible/build.yml -K -e nico_clean=true       # reclaim first
+#   ansible-playbook lab/ansible/build.yml -K -e image_tag=v0.0.1      # custom tag
+#   ansible-playbook lab/ansible/build.yml -K -e force_rebuild=false   # reuse published
+#   ansible-playbook lab/ansible/build.yml -K -e nico_apply_patches=false  # tree as is
+#   ansible-playbook lab/ansible/build.yml -K -e nico_sync_submodule=false # keep HEAD
+#   ansible-playbook lab/ansible/build.yml -K --tags tools             # host setup only
+#   ansible-playbook lab/ansible/build.yml -K -e force_tools=true      # refetch CLIs
+#
+# Tags are tools, clean and build. Needs Debian or Ubuntu amd64, passwordless
+# sudo, and a prior `docker login` as the invoking user (not root).
+
+- name: Build NICo images from this checkout
+  hosts: localhost
+  connection: local
+  become: true
+  environment:
+    # Forwards the invoking user's SSH agent through sudo, so a submodule fetch
+    # over an ssh remote stays authenticated.
+    SSH_AUTH_SOCK: "{{ lookup('env', 'SSH_AUTH_SOCK') }}"
+
+  vars:
+    # ansible_env.HOME is root because fact gathering runs with become true.
+    build_user_home: "{{ lookup('env', 'HOME') }}"
+    # The lab repo this playbook lives in, which carries the patches and scripts.
+    virtlab_root: "{{ playbook_dir }}/../.."
+    # The repo to build, the NICo submodule of that repo rather than a clone.
+    nico_repo_path: "{{ virtlab_root }}/infra-controller"
+    min_free_disk_gb: 150
+    # kubectl minor to match the mgmt k0s track in mgmt.yaml.
+    builder_kubectl_channel: "1.35"
+    # Registry host used for the docker login check below.
+    image_registry: "oci.s3rj1k.fyi"
+    # Subfolder the images publish under so they are not at the registry root.
+    image_namespace: "nv"
+    # Full repository prefix passed to make and used for the registry ref checks.
+    image_repo: "{{ image_registry }}/{{ image_namespace }}"
+    # One moving tag named after the branch, so nothing has to be recomputed and
+    # env.sh needs no derivation. Chart pullPolicy is Always to keep up with it
+    image_tag: "virtlab"
+    # A fixed tag always resolves in the registry once published, so the presence
+    # check would skip forever. Pass force_rebuild=false to reuse what is there
+    force_rebuild: true
+    # Reset the submodule to the commit this repo pins before patching, so every run
+    # starts from the same tree and last run's WIP commit goes away with it. Set
+    # false to build whatever the submodule is checked out at, patches and all.
+    nico_sync_submodule: true
+    # Subject of the throwaway commit the build makes from lab/patches, on a detached
+    # HEAD one commit above the pin. Nothing has to clean it up, the next sync does
+    nico_wip_subject: "{{ WIP_SUBJECT | default('WIP: lab patches (build)') }}"
+    # Apply lab/patches and commit them on top of the lab commit. Set false only
+    # to build the tree exactly as it stands
+    nico_apply_patches: true
+    # Committer for that commit, used when the host has no git config
+    nico_git_name: "{{ GIT_NAME | default('lab builder') }}"
+    nico_git_email: "{{ GIT_EMAIL | default('lab@localhost') }}"
+    # Install the CLI toolchain (kubectl, helm, helmfile, ytt, yq), only the ones
+    # missing from /usr/local/bin. Off once the host is set up and you only rebuild.
+    install_tools: true
+    # Refetch the CLI toolchain even when the binaries are already installed. Leave
+    # false so a rerun never depends on GitHub being reachable.
+    force_tools: false
+    # Reclaim before building. Docker images/caches only, see clean_repo_tree.
+    nico_clean: false
+    # Also `git clean -xfd` the submodule, which deletes untracked and ignored files.
+    # .local_envrc and whatever apply.sh wrote go with it, so it stays off.
+    clean_repo_tree: false
+    # mkosi builds the boot artifacts inside a user namespace, which Ubuntu 24.04
+    # blocks by default. Set false on hosts that never build scout.
+    mkosi_userns_enabled: true
+    # Build output is redirected here not captured because the stream is large
+    # and can carry non UTF8 bytes that trip Ansible strict UTF8 checks.
+    nico_build_log: "{{ build_user_home }}/nico-images-build.log"
+    # One toggle per make target, flip any to false to skip that target. Core
+    # needs base so make rebuilds base as a prerequisite when core runs.
+    nico_build_base: true
+    nico_build_core: true
+    nico_build_rest: true
+    nico_build_machine_validation: true
+    nico_build_boot_artifacts: true
+    nico_build_bfb: true
+    # Cargo keys host arch build scripts by rustc version and never by libc, and the
+    # cross container shares this target dir, so drop what it is too old to execute.
+    nico_bfb_pre_clean: |
+      cross_image="build-artifacts-container-cross-aarch64:latest"
+      floor=""
+      if sg docker -c "docker image inspect ${cross_image}" >/dev/null 2>&1; then
+        floor=$(sg docker -c "docker run --rm ${cross_image} getconf GNU_LIBC_VERSION" 2>/dev/null | awk '{print $NF}')
+      fi
+      floor="${floor:-2.36}"
+      too_new=""
+      for f in target/release/build/*/build-script-* target/release/deps/*.so; do
+        [ -f "${f}" ] || continue
+        need=$(grep -ao 'GLIBC_2\.[0-9]*' "${f}" | sed 's/GLIBC_//' | sort -V | tail -1)
+        [ -n "${need}" ] || continue
+        if [ "$(printf '%s\n%s\n' "${floor}" "${need}" | sort -V | tail -1)" != "${floor}" ]; then
+          too_new="${f} needs glibc ${need}, the cross container has ${floor}"
+          break
+        fi
+      done
+      if [ -n "${too_new}" ]; then
+        echo "CLEAN host arch cargo artifacts, ${too_new}"
+        rm -rf target/release/build target/release/deps target/release/.fingerprint
+      fi
+    # Shared body for the build tasks below. Runs the optional build_pre hook then
+    # make build_target, skipping both when every ref is already in the registry.
+    nico_build_step: |
+      set -o pipefail
+      if [ "{{ force_rebuild | bool | ternary('1', '0') }}" != "1" ]; then
+        all_present=1
+        for ref in {{ build_refs | map('regex_replace', '^', image_repo ~ '/') | join(' ') }}; do
+          if sg docker -c "docker buildx imagetools inspect ${ref}" >/dev/null 2>&1; then
+            echo "present ${ref}"
+          else
+            echo "missing ${ref}"
+            all_present=0
+          fi
+        done
+        if [ "${all_present}" = "1" ]; then
+          echo "SKIP {{ build_target }} already in {{ image_repo }} at {{ image_tag }}"
+          exit 0
+        fi
+      fi
+      echo "BUILD {{ build_target }}"
+      {{ build_pre | default('') }}
+      mk="make {{ build_target }} IMAGE_REGISTRY={{ image_repo }} IMAGE_TAG={{ image_tag }}"
+      mk="${mk} VERSION={{ nico_version }} CI_COMMIT_SHORT_SHA={{ nico_sha }}"
+      printf '\n===== %s =====\n' "${mk}" >>{{ nico_build_log | quote }}
+      if ! sg docker -c "${mk}" >>{{ nico_build_log | quote }} 2>&1; then
+        echo "make {{ build_target }} failed, see {{ nico_build_log }} e.g. tail -n 80 {{ nico_build_log }}"
+        exit 1
+      fi
+
+  pre_tasks:
+    # mkosi needs amd64 and the make targets assume a Debian family host.
+    - name: Assert the host is Debian family on amd64
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+          - ansible_facts.architecture == "x86_64"
+        fail_msg: "build.yml supports Debian/Ubuntu amd64 only."
+      tags: [always]
+
+    # Both carry ../.. from playbook_dir, so flatten them before they reach a chdir
+    # or a message. nico_repo_path is resolved separately from virtlab_root, so
+    # overriding it to a NICo checkout kept elsewhere still works.
+    - name: Resolve the lab and repository paths
+      ansible.builtin.command: readlink -f {{ item | quote }} # noqa: command-instead-of-module
+      loop:
+        - "{{ virtlab_root }}"
+        - "{{ nico_repo_path }}"
+      register: nico_paths_resolved
+      become: false
+      changed_when: false
+      tags: [always]
+
+    - name: Use the resolved lab and repository paths
+      ansible.builtin.set_fact:
+        virtlab_root: "{{ nico_paths_resolved.results[0].stdout }}"
+        nico_repo_path: "{{ nico_paths_resolved.results[1].stdout }}"
+      tags: [always]
+
+    - name: Stat the repository Makefile
+      ansible.builtin.stat:
+        path: "{{ nico_repo_path }}/Makefile"
+      register: nico_makefile_stat
+      tags: [always]
+
+    - name: Fail when the repository has no Makefile
+      ansible.builtin.assert:
+        that: nico_makefile_stat.stat.exists
+        fail_msg: >-
+          No Makefile at {{ nico_repo_path }}, so the submodule is not checked out.
+          Run `git submodule update --init` in {{ virtlab_root }}, or point
+          nico_repo_path at a NICo checkout kept elsewhere.
+      tags: [always]
+
+    - name: Check free disk space on /
+      ansible.builtin.command: df -B1 --output=avail / # noqa: command-instead-of-module
+      register: root_avail
+      changed_when: false
+      tags: [always]
+
+    - name: Fail if free disk space is below the minimum
+      ansible.builtin.assert:
+        that: (root_avail.stdout_lines[1] | trim | int) >= (min_free_disk_gb | int) * 1024 * 1024 * 1024
+        fail_msg: >-
+          Less than {{ min_free_disk_gb }}G free on /, the image build needs it.
+      tags: [always]
+
+  tasks:
+    # WARNING, the prune steps are host wide and reclaim every unused docker
+    # resource, not only NICo's. Local only, no remote registry or cluster.
+    - name: Reclaim disk before building
+      when: nico_clean | bool
+      tags: [clean]
+      block:
+        # sg applies the docker group without needing a fresh login. Runs as the
+        # real user so it uses their docker access.
+        - name: Remove locally-built images under {{ image_registry }}
+          ansible.builtin.shell: |
+            set -o pipefail
+            ids=$(sg docker -c "docker images --filter=reference='{{ image_registry }}/*' -q" | sort -u | tr '\n' ' ')
+            if [ -n "${ids}" ]; then
+              sg docker -c "docker rmi -f ${ids}"
+            fi
+          args:
+            executable: /bin/bash
+          become: false
+          register: rmi_local
+          changed_when: rmi_local.stdout | trim | length > 0
+
+        - name: Prune docker (all unused images, containers, networks, volumes)
+          ansible.builtin.command: sg docker -c "docker system prune -af --volumes"
+          become: false
+          changed_when: true
+
+        - name: Prune docker build cache
+          ansible.builtin.command: sg docker -c "docker builder prune -af"
+          become: false
+          changed_when: true
+
+        - name: Remove mkosi and sccache caches
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ build_user_home }}/.cache/mkosi"
+            - "{{ build_user_home }}/.cache/sccache"
+            - "{{ build_user_home }}/.sccache"
+
+        # file module can't glob, and these are often root-owned (mkosi runs as root).
+        - name: Remove /tmp build artifacts
+          ansible.builtin.shell: rm -rf /tmp/bfb-dump /tmp/mkosi.output-* # noqa: command-instead-of-module
+          changed_when: true
+
+        - name: Warn that the checkout is about to be wiped
+          ansible.builtin.debug:
+            msg: >-
+              clean_repo_tree=true removes every untracked and ignored file under
+              {{ nico_repo_path }}, including the .local_envrc that sources lab.env
+              and whatever lab/patches/apply.sh wrote. Re-run env.sh and apply.sh
+              after. The lab tree itself sits outside the submodule and survives.
+          when: clean_repo_tree | bool
+
+        # -xfd (not -xffd) keeps the nested-repo guard so sibling git repos survive.
+        - name: Clean the repo working tree
+          ansible.builtin.command: git clean -xfd # noqa: command-instead-of-module
+          args:
+            chdir: "{{ nico_repo_path }}"
+          become: false
+          changed_when: true
+          when: clean_repo_tree | bool
+
+        # docker save (images-machine-validation) drops these into the tracked images
+        # dir, git clean above sweeps them and this is the explicit pass.
+        - name: Find machine-validation image tarballs
+          ansible.builtin.find:
+            paths: "{{ nico_repo_path }}/crates/machine-validation/images"
+            patterns: "*.tar"
+          register: mv_image_tars
+          become: false
+          when: clean_repo_tree | bool
+
+        - name: Remove machine-validation image tarballs
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ mv_image_tars.files | default([]) }}"
+          loop_control:
+            label: "{{ item.path }}"
+          when: clean_repo_tree | bool
+
+    # CLI the builder uses to drive the mgmt cluster and apply the lab patches.
+    # kubectl tracks the k0s minor from mgmt.yaml, the rest take their latest.
+    - name: Install the host toolchain
+      when: install_tools | bool
+      tags: [tools]
+      block:
+        # provision-instance.sh reads the root fs uuid straight off the published
+        # qcow2, which needs qemu-io plus its separately packaged curl block driver.
+        - name: Install basic tools
+          ansible.builtin.apt:
+            name:
+              - git
+              - jq
+              - make
+              - pigz
+              - qemu-block-extra
+              - qemu-utils
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        # None of these is version pinned, so a binary already in /usr/local/bin is
+        # good enough and skipping it also skips the release lookup that can fail.
+        - name: Check which CLI tools are already installed
+          ansible.builtin.stat:
+            path: "/usr/local/bin/{{ item }}"
+          loop:
+            - kubectl
+            - helm
+            - helmfile
+            - ytt
+            - yq
+          register: builder_cli_tools
+
+        - name: Select the CLI tools that need installing
+          ansible.builtin.set_fact:
+            install_cli_tools: >-
+              {{ (force_tools | bool)
+                 | ternary(builder_cli_tools.results | map(attribute='item'),
+                           builder_cli_tools.results | rejectattr('stat.exists') | map(attribute='item'))
+                 | list }}
+
+        - name: Report the CLI tools already present
+          ansible.builtin.debug:
+            msg: >-
+              Already installed, skipping:
+              {{ builder_cli_tools.results | map(attribute='item') | difference(install_cli_tools) | join(', ') }}
+          when: install_cli_tools | length < builder_cli_tools.results | length
+
+        - name: Resolve the latest kubectl patch for the mgmt k0s minor
+          ansible.builtin.uri:
+            url: "https://dl.k8s.io/release/stable-{{ builder_kubectl_channel }}.txt"
+            return_content: true
+          register: kubectl_stable
+          changed_when: false
+          when: "'kubectl' in install_cli_tools"
+
+        - name: Install kubectl
+          ansible.builtin.get_url:
+            url: "https://dl.k8s.io/release/{{ kubectl_stable.content | trim }}/bin/linux/amd64/kubectl"
+            dest: /usr/local/bin/kubectl
+            mode: "0755"
+          when: "'kubectl' in install_cli_tools"
+
+        - name: Resolve the latest helm release tag
+          ansible.builtin.uri:
+            url: https://api.github.com/repos/helm/helm/releases/latest
+            return_content: true
+          register: helm_release
+          changed_when: false
+          when: "'helm' in install_cli_tools"
+
+        - name: Install helm
+          ansible.builtin.unarchive:
+            src: "https://get.helm.sh/helm-{{ helm_release.json.tag_name }}-linux-amd64.tar.gz"
+            dest: /usr/local/bin
+            remote_src: true
+            include:
+              - linux-amd64/helm
+            extra_opts:
+              - --strip-components=1
+          when: "'helm' in install_cli_tools"
+
+        - name: Resolve the latest helmfile release tag
+          ansible.builtin.uri:
+            url: https://api.github.com/repos/helmfile/helmfile/releases/latest
+            return_content: true
+          register: helmfile_release
+          changed_when: false
+          when: "'helmfile' in install_cli_tools"
+
+        - name: Install helmfile
+          vars:
+            helmfile_tag: "{{ helmfile_release.json.tag_name }}"
+            helmfile_ver: "{{ helmfile_release.json.tag_name | regex_replace('^v', '') }}"
+          ansible.builtin.unarchive:
+            src: "https://github.com/helmfile/helmfile/releases/download/{{ helmfile_tag }}/helmfile_{{ helmfile_ver }}_linux_amd64.tar.gz"
+            dest: /usr/local/bin
+            remote_src: true
+            include:
+              - helmfile
+          when: "'helmfile' in install_cli_tools"
+
+        - name: Install ytt
+          ansible.builtin.get_url:
+            url: https://github.com/carvel-dev/ytt/releases/latest/download/ytt-linux-amd64
+            dest: /usr/local/bin/ytt
+            mode: "0755"
+          when: "'ytt' in install_cli_tools"
+
+        - name: Install yq
+          ansible.builtin.get_url:
+            url: https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            dest: /usr/local/bin/yq
+            mode: "0755"
+          when: "'yq' in install_cli_tools"
+
+    - name: Build the images
+      tags: [build]
+      block:
+        # Puts the submodule back on the commit this repo pins, discarding last run's
+        # WIP commit and anything apply.sh left behind, so every build starts from the
+        # same tree. Not recursive, the inner submodules are reset further down once
+        # the patches are in.
+        - name: Reset the NICo submodule to the pinned commit
+          ansible.builtin.command: git submodule update --init --force infra-controller # noqa: command-instead-of-module
+          args:
+            chdir: "{{ virtlab_root }}"
+          become: false
+          when: nico_sync_submodule | bool
+          changed_when: true
+
+        # Patches are committed before anything is built, so the build always
+        # sees a clean tree it can name by commit.
+        - name: Apply the lab patches and commit them on top of the pinned commit
+          when: nico_apply_patches | bool
+          become: false
+          block:
+            # Only reachable with the sync off, since it leaves whatever HEAD is at.
+            # Everything modified is about to be committed, so refuse to sweep up
+            # unrelated edits. Submodule content is dirtied by the build itself
+            - name: Check the working tree is clean before patching
+              ansible.builtin.command: git status --porcelain --untracked-files=no --ignore-submodules=dirty # noqa: command-instead-of-module
+              args:
+                chdir: "{{ nico_repo_path }}"
+              register: nico_pre_patch_status
+              changed_when: false
+              when: not (nico_sync_submodule | bool)
+
+            - name: Fail on unrelated local modifications
+              ansible.builtin.assert:
+                that: nico_pre_patch_status.stdout | trim | length == 0
+                fail_msg: >-
+                  {{ nico_repo_path }} has uncommitted changes to tracked files.
+                  Commit or stash them, or run lab/patches/apply.sh -R, then retry.
+                  Drop -e nico_sync_submodule=false to reset it to the pin instead.
+              when: not (nico_sync_submodule | bool)
+
+            # apply.sh lives in this repo and cds into the submodule itself, so it
+            # runs from the lab root rather than from the tree it patches.
+            - name: Apply every lab patch
+              ansible.builtin.command: lab/patches/apply.sh
+              args:
+                chdir: "{{ virtlab_root }}"
+              changed_when: true
+
+            # Lands on a detached HEAD one commit above the pin, which is exactly what
+            # the build wants to name. add -u stages tracked edits only, keeping
+            # build output out
+            - name: Commit the patched tree as a WIP commit
+              ansible.builtin.shell: |
+                set -euo pipefail
+                git add -u
+                if git diff --cached --quiet; then
+                  echo "NOCHANGES"
+                  exit 0
+                fi
+                git -c user.name={{ nico_git_name | quote }} \
+                    -c user.email={{ nico_git_email | quote }} \
+                    commit -q -m {{ nico_wip_subject | quote }}
+                echo "COMMITTED $(git rev-parse --short HEAD)"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              register: nico_patch_commit
+              changed_when: "'COMMITTED' in nico_patch_commit.stdout"
+
+            - name: Report the WIP commit state
+              ansible.builtin.debug:
+                msg: >-
+                  Building the submodule at {{ nico_patch_commit.stdout | trim }}, one
+                  WIP commit carrying every patch on a detached HEAD above the pinned
+                  commit. The next run resets it away, so there is nothing to undo
+                  between builds and the pin this repo records never moves.
+
+        # Without this mkosi cannot unshare and the scout image build dies on
+        # PermissionError. It relaxes the guard for the whole host.
+        - name: Allow unprivileged user namespaces so mkosi can build
+          ansible.builtin.copy:
+            dest: /etc/sysctl.d/60-mkosi-userns.conf
+            mode: "0644"
+            content: |
+              kernel.apparmor_restrict_unprivileged_userns=0
+          register: mkosi_userns_conf
+          when: mkosi_userns_enabled | bool
+
+        - name: Reload sysctl so the namespace change applies now
+          when: mkosi_userns_enabled | bool and mkosi_userns_conf.changed
+          ansible.builtin.command: sysctl --system # noqa: command-instead-of-module
+          changed_when: true
+
+        # mkosi and pxe/ipxe get dirtied by the build. Reset them to their pinned
+        # commits each run so the dirt never shows up as a change to this checkout.
+        - name: Reset git submodules to their pinned commits
+          ansible.builtin.command: git submodule update --init --recursive --force # noqa: command-instead-of-module
+          args:
+            chdir: "{{ nico_repo_path }}"
+          become: false
+          changed_when: false
+
+        - name: Drop untracked files left inside submodules by the build
+          ansible.builtin.command: git submodule foreach --recursive git clean -ffdx # noqa: command-instead-of-module
+          args:
+            chdir: "{{ nico_repo_path }}"
+          become: false
+          changed_when: false
+
+        # bootstrap pulls build dependencies, so refresh the index and upgrade first
+        # rather than resolving them against a stale one
+        - name: Upgrade all packages
+          ansible.builtin.apt:
+            update_cache: true
+            upgrade: safe
+
+        # Requires passwordless sudo since the underlying script escalates internally.
+        - name: Run make bootstrap
+          ansible.builtin.command: make bootstrap
+          args:
+            chdir: "{{ nico_repo_path }}"
+          become: false
+          changed_when: true
+
+        - name: Stat the docker credentials file
+          ansible.builtin.stat:
+            path: "{{ build_user_home }}/.docker/config.json"
+          register: docker_config_stat
+          become: false
+
+        - name: Read the docker credentials file
+          ansible.builtin.slurp:
+            src: "{{ build_user_home }}/.docker/config.json"
+          register: docker_config_raw
+          become: false
+          when: docker_config_stat.stat.exists
+
+        # Catches missing registry auth before the long build instead of after.
+        # Only checks a credential entry exists, not that it still works.
+        - name: Verify docker is logged in to {{ image_registry }}
+          ansible.builtin.assert:
+            that: >-
+              docker_config_stat.stat.exists
+              and image_registry in ((docker_config_raw.content | b64decode | from_json).auths | default({}))
+            fail_msg: >-
+              Not logged in to {{ image_registry }}. Run `docker login {{ image_registry }}`
+              as this playbook's invoking user (not root), then re-run this playbook.
+
+        # Read once and pass to every make below, so all images in a run carry one
+        # version. Left to make, each target would re-derive it from a moving tree
+        - name: Read the version git describe reports for HEAD
+          ansible.builtin.command: git describe --tags --always --dirty # noqa: command-instead-of-module
+          args:
+            chdir: "{{ nico_repo_path }}"
+          become: false
+          register: nico_version_out
+          changed_when: false
+
+        - name: Read the short commit HEAD points at
+          ansible.builtin.command: git rev-parse --short HEAD # noqa: command-instead-of-module
+          args:
+            chdir: "{{ nico_repo_path }}"
+          become: false
+          register: nico_sha_out
+          changed_when: false
+
+        - name: Pin the version the build stamps into every image
+          ansible.builtin.set_fact:
+            nico_version: "{{ nico_version_out.stdout | trim }}"
+            nico_sha: "{{ nico_sha_out.stdout | trim }}"
+
+        - name: Report what is about to be built
+          ansible.builtin.debug:
+            msg: >-
+              Building {{ nico_repo_path }} into {{ image_repo }} at {{ image_tag }}
+              (force_rebuild={{ force_rebuild }}, VERSION={{ nico_version }},
+              CI_COMMIT_SHORT_SHA={{ nico_sha }})
+
+        # Truncate once so the per step appends below start from an empty log.
+        - name: Start a fresh build log
+          ansible.builtin.copy:
+            dest: "{{ nico_build_log }}"
+            content: ""
+            mode: "0644"
+          become: false
+
+        # One task per make target so each is its own step in the play recap.
+        - name: Build the container images one make target at a time
+          become: false
+          environment:
+            PATH: "{{ build_user_home }}/.cargo/bin:{{ ansible_env.PATH }}"
+          block:
+            - name: Build the Core base build-containers
+              ansible.builtin.shell: "{{ nico_build_step }}"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              vars:
+                build_target: images-base
+                build_refs:
+                  - "nico-buildcontainer:{{ image_tag }}-amd64"
+                  - "nico-buildcontainer:{{ image_tag }}-arm64"
+                  - "nico-runtime-container:{{ image_tag }}-amd64"
+                  - "nico-runtime-container:{{ image_tag }}-arm64"
+              when: nico_build_base | bool
+              register: nico_build_base_result
+              changed_when: "'BUILD ' in nico_build_base_result.stdout"
+
+            - name: Build the NICo Core image (nico)
+              ansible.builtin.shell: "{{ nico_build_step }}"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              vars:
+                build_target: images-core
+                build_refs:
+                  - "nico:{{ image_tag }}"
+              when: nico_build_core | bool
+              register: nico_build_core_result
+              changed_when: "'BUILD ' in nico_build_core_result.stdout"
+
+            - name: Build the REST service images
+              ansible.builtin.shell: "{{ nico_build_step }}"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              vars:
+                build_target: images-rest
+                build_refs:
+                  - "nico-rest-api:{{ image_tag }}"
+                  - "nico-rest-workflow:{{ image_tag }}"
+                  - "nico-rest-site-manager:{{ image_tag }}"
+                  - "nico-rest-site-agent:{{ image_tag }}"
+                  - "nico-rest-db:{{ image_tag }}"
+                  - "nico-rest-cert-manager:{{ image_tag }}"
+                  - "nico-flow:{{ image_tag }}"
+                  - "nico-psm:{{ image_tag }}"
+                  - "nico-nsm:{{ image_tag }}"
+                  - "nico-mcp:{{ image_tag }}"
+              when: nico_build_rest | bool
+              register: nico_build_rest_result
+              changed_when: "'BUILD ' in nico_build_rest_result.stdout"
+
+            # Also writes a local runner tar under the machine validation images dir.
+            # Skipping when the remote already exists does not regenerate that tar.
+            - name: Build the machine-validation images
+              ansible.builtin.shell: "{{ nico_build_step }}"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              vars:
+                build_target: images-machine-validation
+                build_refs:
+                  - "machine-validation:{{ image_tag }}"
+              when: nico_build_machine_validation | bool
+              register: nico_build_mv_result
+              changed_when: "'BUILD ' in nico_build_mv_result.stdout"
+
+            - name: Build the x86 boot-artifact image
+              ansible.builtin.shell: "{{ nico_build_step }}"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              vars:
+                build_target: images-boot-artifacts
+                build_refs:
+                  - "boot-artifacts-x86_64:{{ image_tag }}"
+              when: nico_build_boot_artifacts | bool
+              register: nico_build_boot_result
+              changed_when: "'BUILD ' in nico_build_boot_result.stdout"
+
+            - name: Build the aarch64 DPU BFB image
+              ansible.builtin.shell: "{{ nico_build_step }}"
+              args:
+                executable: /bin/bash
+                chdir: "{{ nico_repo_path }}"
+              vars:
+                build_target: images-bfb
+                build_refs:
+                  - "boot-artifacts-aarch64:{{ image_tag }}"
+                build_pre: "{{ nico_bfb_pre_clean }}"
+              when: nico_build_bfb | bool
+              register: nico_build_bfb_result
+              changed_when: "'BUILD ' in nico_build_bfb_result.stdout"
+
+        # setup.sh deploys nvmetal-carbide but the Makefile builds nico, so copy it via
+        # pull tag push (imagetools create drops cross repo children on our registry).
+        - name: Publish the core image as nvmetal-carbide (the name setup.sh deploys)
+          ansible.builtin.shell: |
+            set -euo pipefail
+            nc="{{ image_repo }}/nvmetal-carbide:{{ image_tag }}"
+            ni="{{ image_repo }}/nico:{{ image_tag }}"
+            nc_repo="{{ image_repo }}/nvmetal-carbide"
+
+            # Complete means the index and every child digest it lists resolve in
+            # nvmetal-carbide, an existing index alone is not proof the tag pulls.
+            carbide_complete() {
+              local kids kid
+              kids=$(sg docker -c "docker buildx imagetools inspect --raw ${nc}" 2>/dev/null |
+                grep -oE 'sha256:[a-f0-9]{64}' | sort -u) || return 1
+              [ -n "${kids}" ] || return 1
+              for kid in ${kids}; do
+                sg docker -c "docker buildx imagetools inspect --raw ${nc_repo}@${kid}" >/dev/null 2>&1 || return 1
+              done
+            }
+
+            if [ "{{ force_rebuild | bool | ternary('1', '0') }}" != "1" ] && carbide_complete; then
+              echo "SKIP nvmetal-carbide already complete at {{ image_tag }}"
+              exit 0
+            fi
+            # buildx pushes each arch as an index carrying an attestation, so a plain
+            # pull looks for the host platform and misses. Ask for the arch by name.
+            for arch in amd64 arm64; do
+              sg docker -c "docker pull --platform linux/${arch} ${ni}-${arch}"
+              sg docker -c "docker tag ${ni}-${arch} ${nc}-${arch}"
+              sg docker -c "docker push ${nc}-${arch}"
+            done
+            sg docker -c "docker buildx imagetools create -t ${nc} ${nc}-amd64 ${nc}-arm64"
+            if ! carbide_complete; then
+              echo "nvmetal-carbide index at {{ image_tag }} has unresolved children"
+              exit 1
+            fi
+            echo "CREATED nvmetal-carbide"
+          args:
+            executable: /bin/bash
+          become: false
+          when: nico_build_core | bool
+          register: nvmetal_retag
+          changed_when: "'CREATED' in nvmetal_retag.stdout"
+
+        - name: Report the built tag
+          ansible.builtin.debug:
+            msg: >-
+              Images published to {{ image_repo }} at {{ image_tag }}, stamped
+              VERSION={{ nico_version }} from commit {{ nico_sha }}. lab/scripts/env.sh
+              defaults to the same tag, export CORE_TAG={{ image_tag }} only if you
+              passed a custom image_tag.

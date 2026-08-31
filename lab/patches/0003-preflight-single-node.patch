@@ -1,0 +1,22 @@
+diff --git a/helm-prereqs/preflight.sh b/helm-prereqs/preflight.sh
+index d011ff9b8..777df0866 100755
+--- a/helm-prereqs/preflight.sh
++++ b/helm-prereqs/preflight.sh
+@@ -763,7 +763,7 @@ if [[ "${_CLUSTER_REACHABLE}" == "true" ]]; then
+ 
+     _total=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+ 
+-    if [[ "${_schedulable}" -lt 3 ]]; then
++    if [[ "${_schedulable}" -lt 1 ]]; then
+         ERRORS+=("Only ${_schedulable}/${_total} nodes are schedulable (Ready + untainted) — at least 3 required for HA Vault and Postgres")
+     fi
+ 
+@@ -841,7 +841,7 @@ if [[ "${_CLUSTER_REACHABLE}" == "true" ]]; then
+     # Override the check image for air-gapped clusters:
+     #   export PREFLIGHT_CHECK_IMAGE=my-registry.example.com/busybox:1.36
+     # -----------------------------------------------------------------------
+-    _CHECK_IMAGE="${PREFLIGHT_CHECK_IMAGE:-busybox:1.36}"
++    _CHECK_IMAGE="${PREFLIGHT_CHECK_IMAGE:-mirror.gcr.io/library/busybox:1.36}"
+     _TS="$(date +%s)"
+     _node_names=$(kubectl get nodes \
+         -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)

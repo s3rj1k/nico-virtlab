@@ -1,0 +1,58 @@
+diff --git a/helm-prereqs/operators/values/vault.yaml b/helm-prereqs/operators/values/vault.yaml
+index 363699af4..7461fd162 100644
+--- a/helm-prereqs/operators/values/vault.yaml
++++ b/helm-prereqs/operators/values/vault.yaml
+@@ -15,13 +15,8 @@ server:
+   ## -------------------------------------------------------------------------
+   ## Resources
+   ## -------------------------------------------------------------------------
+-  resources:
+-    requests:
+-      cpu: 2000m
+-      memory: 8Gi
+-    limits:
+-      cpu: 2000m
+-      memory: 16Gi
++  ## Dropped so pods fit the small mgmt VM, the chart omits resources when empty
++  resources: {}
+ 
+   ## -------------------------------------------------------------------------
+   ## Health probes
+@@ -127,7 +122,7 @@ server:
+ 
+   ha:
+     enabled: true
+-    replicas: 3
++    replicas: 1
+     raft:
+       enabled: true
+       setNodeId: true
+@@ -157,27 +152,13 @@ server:
+             leader_client_cert_file  = "/vault/userconfig/vault-raft-tls/tls.crt"
+             leader_client_key_file   = "/vault/userconfig/vault-raft-tls/tls.key"
+           }
+-          retry_join {
+-            leader_tls_servername    = "vault-1.vault-internal"
+-            leader_api_addr          = "https://vault-1.vault-internal:8200"
+-            leader_ca_cert_file      = "/vault/userconfig/vault-raft-tls/ca.crt"
+-            leader_client_cert_file  = "/vault/userconfig/vault-raft-tls/tls.crt"
+-            leader_client_key_file   = "/vault/userconfig/vault-raft-tls/tls.key"
+-          }
+-          retry_join {
+-            leader_tls_servername    = "vault-2.vault-internal"
+-            leader_api_addr          = "https://vault-2.vault-internal:8200"
+-            leader_ca_cert_file      = "/vault/userconfig/vault-raft-tls/ca.crt"
+-            leader_client_cert_file  = "/vault/userconfig/vault-raft-tls/tls.crt"
+-            leader_client_key_file   = "/vault/userconfig/vault-raft-tls/tls.key"
+-          }
+ 
+           autopilot {
+             cleanup_dead_servers          = "true"
+             last_contact_threshold        = "200ms"
+             last_contact_failure_threshold = "10m"
+             max_trailing_logs             = 250000
+-            min_quorum                    = 3
++            min_quorum                    = 1
+             server_stabilization_time     = "10s"
+           }
+         }

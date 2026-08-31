@@ -1,0 +1,28 @@
+diff --git a/helm/charts/nico-dns/templates/service.yaml b/helm/charts/nico-dns/templates/service.yaml
+index 8e244eedb..935c1f2b4 100644
+--- a/helm/charts/nico-dns/templates/service.yaml
++++ b/helm/charts/nico-dns/templates/service.yaml
+@@ -6,6 +6,9 @@ metadata:
+   labels:
+     {{- include "nico-dns.labels" . | nindent 4 }}
+ spec:
++  {{- with .Values.service.clusterIP }}
++  clusterIP: {{ . | quote }}
++  {{- end }}
+   ipFamilyPolicy: PreferDualStack
+   selector:
+     {{- include "nico-dns.selectorLabels" . | nindent 4 }}
+diff --git a/helm/charts/nico-dns/values.yaml b/helm/charts/nico-dns/values.yaml
+index 6c202f296..3326d1237 100644
+--- a/helm/charts/nico-dns/values.yaml
++++ b/helm/charts/nico-dns/values.yaml
+@@ -34,6 +34,9 @@ annotations:
+ listenAddress: "[::]:53"
+ 
+ service:
++  ## Pin a stable ClusterIP so an in-cluster resolver can forward the NICo zone
++  ## here (forward targets need a literal IP). Empty = assigned dynamically.
++  clusterIP: ""
+   ports:
+     - port: 53
+       name: tcp

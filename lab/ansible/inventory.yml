@@ -1,0 +1,23 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# Inventory for the mgmt and worker playbooks, run from builder. Addresses default to
+# the heat params and are overridden from the environment, not with -e.
+#
+#   ansible-playbook -i lab/ansible/inventory.yml lab/ansible/mgmt.yaml
+#   MGMT_IP=10.0.0.9 ansible-playbook -i lab/ansible/inventory.yml lab/ansible/mgmt.yaml
+#
+# build.yml is not here, it acts on the local checkout and stays hosts localhost.
+
+all:
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    # Same login user on every node, reached with the forwarded agent. Lab hosts
+    # recycle so their keys are neither checked nor recorded
+    ansible_ssh_common_args: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  hosts:
+    mgmt:
+      ansible_host: "{{ lookup('env', 'MGMT_IP') | default('10.42.71.102', true) }}"
+    worker:
+      ansible_host: "{{ lookup('env', 'WORKER_IP') | default('10.42.71.103', true) }}"

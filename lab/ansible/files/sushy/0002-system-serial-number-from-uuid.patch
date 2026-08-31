@@ -1,0 +1,21 @@
+From 696ba214bbb3665e6866b24a281dfe3ab0340fec Mon Sep 17 00:00:00 2001
+From: s3rj1k <evasive.gyron@gmail.com>
+Date: Wed, 3 Jun 2026 00:09:03 +0000
+Subject: [PATCH] Add ComputerSystem SerialNumber derived from domain UUID
+
+---
+ sushy_tools/emulator/templates/system.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/sushy_tools/emulator/templates/system.json b/sushy_tools/emulator/templates/system.json
+index 16b1f952..be4a102a 100644
+--- a/sushy_tools/emulator/templates/system.json
++++ b/sushy_tools/emulator/templates/system.json
+@@ -3,6 +3,7 @@
+     "Id": {{ identity|string|tojson }},
+     "Name": {{ name|string|tojson }},
+     "UUID": {{ uuid|string|tojson }},
++    "SerialNumber": {{ uuid|string|replace('-', '')|upper|tojson }},
+     {%- if feature_set == "full" %}
+     "Manufacturer": "Sushy Emulator",
+     "Status": {

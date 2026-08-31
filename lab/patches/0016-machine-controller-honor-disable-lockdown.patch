@@ -1,0 +1,42 @@
+Honor disable_lockdown in the WaitingForPlatformConfiguration lockdown check.
+
+A host profile that opts out of lockdown management still fell into the
+disable flow here, because this arm only tested the BMC status. Emulated and
+stub BMCs answer with a constant status the disable flow can never satisfy, so
+SetLockdown hands off to PollingLockdownStatus, whose miss branch returns an
+uncapped StateHandlerOutcome::wait and the machine never leaves HostInit.
+
+The opt-out already suppresses every re-enable (SetLockdown for
+LockdownMode::Enable, LockHost in platform config and reprovision), so gating
+this arm on it keeps both halves of the flag consistent.
+
+register.sh passes --disable-lockdown true, so every lab machine hits this.
+
+diff --git a/crates/machine-controller/src/handler.rs b/crates/machine-controller/src/handler.rs
+index af3dd59d3..cb6c4e2d6 100644
+--- a/crates/machine-controller/src/handler.rs
++++ b/crates/machine-controller/src/handler.rs
+@@ -7334,7 +7334,12 @@ impl StateHandler for HostMachineStateHandler {
+                                 e
+                             )));
+                         }
+-                        Ok(lockdown_status) if !lockdown_status.is_fully_disabled() => {
++                        // Honor the profile opt-out here too. An emulated BMC never reports
++                        // lockdown as disabled, so PollingLockdownStatus would wait for ever.
++                        Ok(lockdown_status)
++                            if !lockdown_status.is_fully_disabled()
++                                && !mh_snapshot.host_snapshot.host_profile.disable_lockdown =>
++                        {
+                             tracing::info!(
+                                 "Lockdown is enabled for {host_machine_id} during machine_setup, disabling now."
+                             );
+@@ -7349,7 +7354,8 @@ impl StateHandler for HostMachineStateHandler {
+                             return Ok(StateHandlerOutcome::transition(next_state));
+                         }
+                         Ok(_) => {
+-                            // Lockdown is disabled, proceed with machine_setup
++                            // Lockdown is disabled or the profile opts out of managing it,
++                            // proceed with machine_setup
+                         }
+                     }
+ 

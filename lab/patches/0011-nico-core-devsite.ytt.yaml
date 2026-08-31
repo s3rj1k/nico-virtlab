@@ -1,0 +1,95 @@
+#! target: helm-prereqs/values/nico-core.yaml
+#! Structural devsite values. TOML site config fixups live in 0012.
+#@ load("@ytt:overlay", "overlay")
+
+#@overlay/match by=overlay.all
+---
+global:
+  image:
+    pullPolicy: Always
+  #! Registry serves reads anonymously so no pull secret is needed. Empties the
+  #! imagepullsecret ref that setup.sh only fills when REGISTRY_PULL_SECRET is set.
+  #@overlay/replace
+  imagePullSecrets: []
+
+nico-api:
+  hostname: "carbide-api.192.168.42.211.sslip.io"
+  externalService:
+    annotations:
+      metallb.universe.tf/loadBalancerIPs: "192.168.42.211"
+  certificate:
+    extraDnsNames:
+    #@overlay/match by=overlay.index(0)
+    - "carbide-api.192.168.42.211.sslip.io"
+  #! nico-api owns the forge-system namespace for the legacy aliases (nico-pxe
+  #! lands in it too) so create it here or the core install fails with ns not found.
+  #@overlay/match missing_ok=True
+  legacyAlias:
+    enabled: true
+    aliases:
+    - name: carbide-api
+      namespace: forge-system
+      createNamespace: true
+
+nico-dhcp:
+  #! The chart reads this VIP back as the kea server identifier, so option 54 is
+  #! the VIP rather than the pod IP that no client off the cluster reaches.
+  externalService:
+    annotations:
+      metallb.universe.tf/loadBalancerIPs: "192.168.42.201"
+  config:
+    kea:
+      hookParameters:
+        nameservers: "192.168.42.102"
+        ntpServer: "192.168.42.206"
+        provisioningServer: "192.168.42.204"
+
+nico-dns:
+  #@overlay/match missing_ok=True
+  service:
+    clusterIP: "10.96.0.53"
+  #@overlay/replace
+  externalService:
+    enabled: false
+
+nico-pxe:
+  #! repository only, the tag inherits global.image.tag which is the deployed core.
+  #@overlay/replace
+  bootArtifactContainers:
+  - name: boot-artifacts-x86-64
+    repository: oci.s3rj1k.fyi/nv/boot-artifacts-x86_64
+    command: ["sh", "-c", "cp -r /x86_64 /forge-boot-artifacts/blobs/internal"]
+  - name: boot-artifacts-aarch64
+    repository: oci.s3rj1k.fyi/nv/boot-artifacts-aarch64
+    command: ["sh", "-c", "cp -r /aarch64 /apt /forge-boot-artifacts/blobs/internal"]
+  - name: machine-validation-config
+    repository: oci.s3rj1k.fyi/nv/machine-validation
+    command: ["sh", "-c", "cp -r /machine-validation /forge-boot-artifacts/blobs/internal"]
+  #@overlay/match missing_ok=True
+  env:
+    CARBIDE_PXE_URL: "http://192.168.42.204:8080"
+    CARBIDE_API_URL: "https://carbide-api.192.168.42.211.sslip.io"
+    CARBIDE_API_INTERNAL_URL: "https://nico-api.nico-system.svc.cluster.local:1079"
+  externalService:
+    annotations:
+      metallb.universe.tf/loadBalancerIPs: "192.168.42.204"
+
+nico-ssh-console-rs:
+  externalService:
+    annotations:
+      metallb.universe.tf/loadBalancerIPs: "192.168.42.205"
+
+nico-ntp:
+  externalService:
+    #@overlay/replace
+    perPodAnnotations:
+    - metallb.universe.tf/loadBalancerIPs: "192.168.42.206"
+    - metallb.universe.tf/loadBalancerIPs: "192.168.42.207"
+    - metallb.universe.tf/loadBalancerIPs: "192.168.42.208"
+
+#! unbound stays disabled (mgmt CoreDNS serves .forge). Replace the whole block
+#! so its empty VIP placeholder is dropped, but keep localData for the preflight.
+#@overlay/replace
+unbound:
+  enabled: false
+  localData: []

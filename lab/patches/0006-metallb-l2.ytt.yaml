@@ -1,0 +1,29 @@
+#! target: helm-prereqs/values/metallb-config.yaml
+#! Lab MetalLB pools and L2 advertisement.
+#@ load("@ytt:overlay", "overlay")
+
+#@overlay/match by=overlay.subset({"kind": "IPAddressPool", "metadata": {"name": "vip-pool-internal"}})
+---
+spec:
+  #@overlay/replace
+  addresses:
+    - 192.168.42.200-192.168.42.210
+
+#@overlay/match by=overlay.subset({"kind": "IPAddressPool", "metadata": {"name": "vip-pool-external"}})
+---
+spec:
+  #@overlay/replace
+  addresses:
+    - 192.168.42.211-192.168.42.220
+
+#@overlay/append
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2-advertisement
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - vip-pool-internal
+    - vip-pool-external

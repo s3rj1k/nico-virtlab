@@ -1,0 +1,24 @@
+diff --git a/helm-prereqs/unseal_vault.sh b/helm-prereqs/unseal_vault.sh
+index 07e17fea2..5fa61507a 100755
+--- a/helm-prereqs/unseal_vault.sh
++++ b/helm-prereqs/unseal_vault.sh
+@@ -91,7 +91,7 @@ _vault_status_json() {
+ echo "Waiting for all 3 Vault pods to be initialized..."
+ # StatefulSets create pods sequentially — vault-1/vault-2 may not exist yet.
+ # Poll until each pod exists, then wait for Initialized.
+-for POD in vault-0 vault-1 vault-2; do
++for POD in vault-0; do
+     until kubectl get pod "${POD}" -n "${NAMESPACE}" &>/dev/null; do
+         echo "  ${POD} not yet created, retrying in 5s..."
+         sleep 5
+@@ -184,8 +184,8 @@ unseal_pod() {
+ unseal_pod vault-0
+ # Wait for vault-0 (leader) to be elected before unsealing followers
+ sleep 10
+-unseal_pod vault-1
+-unseal_pod vault-2
++# unseal_pod vault-1 skipped, replicas=1
++# unseal_pod vault-2 skipped, replicas=1
+ 
+ # Store individual unseal keys and root token as K8s secrets
+ CLUSTER_JSON="$(kubectl -n "${NAMESPACE}" get secret vault-cluster-keys -o json \

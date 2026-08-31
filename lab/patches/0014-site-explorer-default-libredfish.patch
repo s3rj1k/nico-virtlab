@@ -1,0 +1,41 @@
+diff --git a/crates/api-core/src/cfg/README.md b/crates/api-core/src/cfg/README.md
+index d5c789fad..a227c3a77 100644
+--- a/crates/api-core/src/cfg/README.md
++++ b/crates/api-core/src/cfg/README.md
+@@ -424,7 +424,7 @@ shipped configuration selects a plaintext mode.
+ | `power_shelves_created_per_run` | `u64` | `1` | Max power shelves created per run. |
+ | `create_switches` | `bool` | `true` | Auto-create Switch state machines for explored switches with a matching `expected_switches` record. |
+ | `switches_created_per_run` | `u64` | `9` | Max switches created per run. |
+-| `explore_mode` | `SiteExplorerExploreMode` | `NvRedfish` | Redfish backend: `libredfish`, `nv-redfish`, or `compare-result`. |
++| `explore_mode` | `SiteExplorerExploreMode` | `LibRedfish` | Redfish backend: `libredfish`, `nv-redfish`, or `compare-result`. |
+ | `dpu_policy` | `Option<HostDpuPolicy>` | — (effective: `manage`) | Site-wide policy for DPU hardware: `manage`, `nic`, or `ignore`. Per-host `nic` and `ignore` override it; per-host `manage` inherits it for backward compatibility. When omitted, the site default is `manage`. The previous `use_as_nic` value and the legacy `dpu_mode` field with `dpu_mode` / `nic_mode` / `no_dpu` values remain accepted during deserialization. |
+ 
+ ### `StateControllerConfig`
+diff --git a/crates/site-explorer/src/bmc_endpoint_explorer.rs b/crates/site-explorer/src/bmc_endpoint_explorer.rs
+index c7a837e28..a6b64748f 100644
+--- a/crates/site-explorer/src/bmc_endpoint_explorer.rs
++++ b/crates/site-explorer/src/bmc_endpoint_explorer.rs
+@@ -1816,8 +1816,8 @@ mod tests {
+             bmc_mock::tls::server_config(None::<&str>).unwrap(),
+         );
+ 
+-        let mode = crate::config::SiteExplorerConfig::default_explore_mode();
+-        assert_eq!(mode, SiteExplorerExploreMode::NvRedfish);
++        // Pinned rather than read from the default, this case covers nv-redfish.
++        let mode = SiteExplorerExploreMode::NvRedfish;
+         let proxy_address = Arc::new(ArcSwap::new(Arc::new(None)));
+         let explorer = BmcEndpointExplorer::new(
+             Arc::new(RedfishSim::default()),
+diff --git a/crates/site-explorer/src/config.rs b/crates/site-explorer/src/config.rs
+index 3a982f99b..c3f6cecde 100644
+--- a/crates/site-explorer/src/config.rs
++++ b/crates/site-explorer/src/config.rs
+@@ -335,7 +335,7 @@ impl SiteExplorerConfig {
+     }
+ 
+     pub const fn default_explore_mode() -> SiteExplorerExploreMode {
+-        SiteExplorerExploreMode::NvRedfish
++        SiteExplorerExploreMode::LibRedfish
+     }
+ }
+ 

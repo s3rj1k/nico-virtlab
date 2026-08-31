@@ -1,0 +1,108 @@
+diff --git a/helm-prereqs/values/nico-core.yaml b/helm-prereqs/values/nico-core.yaml
+index 070d005a1..b15c9a768 100644
+--- a/helm-prereqs/values/nico-core.yaml
++++ b/helm-prereqs/values/nico-core.yaml
+@@ -37,10 +37,14 @@ nico-api:
+       # -----------------------------------------------------------------------
+       # Site identity — REQUIRED: fill in your site's values.
+       # -----------------------------------------------------------------------
+-      sitename = ""                              # REQUIRED: short site identifier
+-      initial_domain_name = ""                   # REQUIRED: base DNS domain for the site
+-      attestation_enabled = false
+-      max_concurrent_machine_updates = 20
++      sitename = "devenv"
++      initial_domain_name = "192.168.42.10.sslip.io"
++      attestation_enabled = false                # enable TPM/DPU attestation
++      max_concurrent_machine_updates = 20        # cap parallel firmware/config pushes
++      vpc_peering_policy = "exclusive"           # "exclusive" | "shared"
++      # Hardcoded internal-RBAC and casbin SPIFFE identifiers do not match the
++      # chart-generated SVIDs, so both layers are disabled in dev.
++      bypass_rbac = true
+ 
+       # -----------------------------------------------------------------------
+       # DHCP servers reachable from this site — REQUIRED: your nico-dhcp VIP(s).
+@@ -59,15 +63,25 @@ nico-api:
+       # site_fabric_prefixes: prefixes that ARE part of the site fabric.
+       # deny_prefixes: prefixes instances must NOT reach (OOB, ctrl-plane, underlay).
+       # -----------------------------------------------------------------------
+-      site_fabric_prefixes = []                  # REQUIRED: your fabric CIDR(s)
+-      deny_prefixes = []                         # your OOB / control-plane / underlay CIDRs
++      site_fabric_prefixes = ["192.168.42.0/24"] # 2nd-NIC L2 (HostInband segment lives here)
++      deny_prefixes = ["10.42.71.0/24"]          # OOB net, the sushy BMC lives here
+ 
+       # -----------------------------------------------------------------------
+       # Site explorer — periodic background scan of site inventory
+       # -----------------------------------------------------------------------
+       [site_explorer]
++      # Only libredfish carries the native Sushy vendor, nv-redfish has no notion
++      # of the emulator, so the lab pins the backend rather than taking the default
++      explore_mode = "libredfish"
++      bmc_proxy = ":8000"            # sushy BMC port, matches BMC_PORT in env.sh
+       run_interval = "30s"
+ 
++      [auth]
++      permissive_mode = true
++
++      [auth.trust]
++      additional_issuer_cns = ["site-root"]
++
+       # -----------------------------------------------------------------------
+       # Machine + BOM validation
+       # -----------------------------------------------------------------------
+@@ -84,15 +98,15 @@ nico-api:
+       # -----------------------------------------------------------------------
+       [pools.lo-ip]
+       type = "ipv4"
+-      ranges = []                                # REQUIRED: e.g. [{ start = "...", end = "..." }]
++      ranges = [{ start = "10.255.0.1", end = "10.255.0.254" }]   # dev loopbacks, off the 192.168.42.0/24 bridge
+ 
+       [pools.vlan-id]
+       type = "integer"
+-      ranges = []                                # REQUIRED: your VLAN ID range, e.g. [{ start = "100", end = "501" }]
++      ranges = [{ start = "100", end = "501" }]
+ 
+       [pools.vni]
+       type = "integer"
+-      ranges = []                                # REQUIRED: your VXLAN VNI range, e.g. [{ start = "1024500", end = "1024800" }]
++      ranges = [{ start = "1024500", end = "1024800" }]
+ 
+       [pools.vpc-vni]
+       type = "integer"
+@@ -100,7 +114,7 @@ nico-api:
+       # must match the config on your FNN gateways and must NOT be expanded without coordinating
+       # with your network team. The range must also NOT include the fixed admin_vpc vpc_vni
+       # value set in [fnn.admin_vpc] below. Example for non-FNN: [{ start = "0", end = "100" }]
+-      ranges = []
++      ranges = [{ start = "0", end = "100" }]
+ 
+       # -----------------------------------------------------------------------
+       # Networks — named L3 segments visible to nico-api.
+@@ -120,6 +134,19 @@ nico-api:
+       #   mtu = 1500
+       #   reserve_first = 2
+       # -----------------------------------------------------------------------
++      # Flat-VPC HostInband segment seeded by nico-api at startup, replacing the old
++      # register.sh grpcurl calls. It also creates the static-assignments UNDERLAY anchor.
++      [vpcs.devenv_flat_vpc]
++      organization_id = "devenv_test_org"
++      network_virtualization_type = "flat"
++
++      [networks.devenv_host_inband]
++      type = "hostinband"
++      prefix = "192.168.42.0/24"
++      gateway = "192.168.42.1"
++      mtu = 1500
++      reserve_first = 220                # host nics live in .221+ (HOST_IP in lab/scripts/env.sh)
++      vpc_name = "devenv_flat_vpc"
+ 
+       # -----------------------------------------------------------------------
+       # InfiniBand (disabled unless your site has an IB fabric)
+@@ -159,7 +186,7 @@ nico-api:
+ 
+ 
+       [fnn.admin_vpc]
+-      enabled = true # Set to true when FNN is enabled on site.
++      enabled = false # Lab has no FNN gateways so no admin VPC or [networks.admin].
+       # vpc_vni
+       vpc_vni = 61325 # Replace 61325 with the VNI that will be used for the admin VPC
+ 

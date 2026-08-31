@@ -1,0 +1,13 @@
+diff --git a/helm-prereqs/values/nico-site-agent.yaml b/helm-prereqs/values/nico-site-agent.yaml
+index 51c4ed7ec..ee1ed4b09 100644
+--- a/helm-prereqs/values/nico-site-agent.yaml
++++ b/helm-prereqs/values/nico-site-agent.yaml
+@@ -28,7 +28,7 @@ global:
+       name: vault-nico-issuer
+       group: cert-manager.io
+ 
+-replicaCount: 3
++replicaCount: 1
+ 
+ bootstrap:
+   enabled: true

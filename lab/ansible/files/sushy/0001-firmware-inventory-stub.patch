@@ -1,0 +1,45 @@
+From ceee79197c31917dccdb1a6bd0163e0ba252a763 Mon Sep 17 00:00:00 2001
+From: s3rj1k <evasive.gyron@gmail.com>
+Date: Tue, 2 Jun 2026 23:35:39 +0000
+Subject: [PATCH] Add empty FirmwareInventory collection stub under
+ UpdateService
+
+---
+ sushy_tools/emulator/controllers/update_service.py        | 8 ++++++++
+ .../emulator/templates/firmware_inventory_collection.json | 8 ++++++++
+ 2 files changed, 16 insertions(+)
+ create mode 100644 sushy_tools/emulator/templates/firmware_inventory_collection.json
+
+diff --git a/sushy_tools/emulator/controllers/update_service.py b/sushy_tools/emulator/controllers/update_service.py
+index 2f22f93e..e03e0706 100644
+--- a/sushy_tools/emulator/controllers/update_service.py
++++ b/sushy_tools/emulator/controllers/update_service.py
+@@ -31,6 +31,14 @@ def update_service_resource():
+     )
+ 
+ 
++@update_service.route('/FirmwareInventory', methods=['GET'])
++@api_utils.returns_json
++def firmware_inventory_collection():
++    # Stub: advertise an empty firmware inventory (no members).
++    api_utils.debug('Serving firmware inventory (stub, empty collection)')
++    return flask.render_template('firmware_inventory_collection.json')
++
++
+ @update_service.route('/Actions/UpdateService.SimpleUpdate',
+                       methods=['POST'])
+ @api_utils.returns_json
+diff --git a/sushy_tools/emulator/templates/firmware_inventory_collection.json b/sushy_tools/emulator/templates/firmware_inventory_collection.json
+new file mode 100644
+index 00000000..1c613961
+--- /dev/null
++++ b/sushy_tools/emulator/templates/firmware_inventory_collection.json
+@@ -0,0 +1,8 @@
++{
++    "@odata.type": "#SoftwareInventoryCollection.SoftwareInventoryCollection",
++    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory",
++    "@odata.context": "/redfish/v1/$metadata#SoftwareInventoryCollection.SoftwareInventoryCollection",
++    "Name": "Firmware Inventory Collection",
++    "Members@odata.count": 0,
++    "Members": []
++}

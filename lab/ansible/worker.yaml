@@ -1,0 +1,531 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# Libvirt/KVM + vanilla sushy-tools (Redfish) for the lab worker VM, the box that
+# hosts the emulated bare-metal machines NICo provisions. Run on the node.
+
+# The emulated VMs attach directly to the worker's 2nd NIC via macvtap (no host
+# bridge, no dnsmasq, no NAT here). Set PROVISIONING_NIC to that interface.
+
+- name: Libvirt hypervisor + sushy-tools on the lab worker node
+  hosts: worker
+  become: true
+  gather_facts: true
+
+  vars:
+    # Wait for the target's cloud-init when it was just provisioned from heat
+    wait_for_cloud_init: "{{ CLOUD_INIT | default(false) }}"
+    # 2nd NIC the emulated VMs attach to directly via macvtap. Override if not ens4.
+    provisioning_nic: "{{ PROVISIONING_NIC | default('ens4') }}"
+    provisioning_network: default   # libvirt network name the VMs attach to
+    # Vanilla sushy-tools from master. PyPI 2.2.0 predates SUSHY_EMULATOR_VENDOR,
+    # which is what lets libredfish pick its native Sushy vendor
+    sushy_tools_pip: "{{ SUSHY_TOOLS_PIP | default('git+https://github.com/openstack/sushy-tools.git@master') }}"
+    redfish_port: 8000
+    # Vendor string sushy puts in its ServiceRoot. libredfish maps it onto its
+    # own native Sushy vendor, replacing the old scripted vendor entirely
+    redfish_vendor: "{{ REDFISH_VENDOR | default('Sushy') }}"
+    # Minimal fixes lifted from s3rj1k/sushy-tools when vanilla falls short. Drop patch
+    # files into files/sushy, they stage to the worker and apply in sorted order
+    sushy_patch_glob: "{{ playbook_dir }}/files/sushy/*.patch"
+    sushy_patch_dest: /opt/sushy-tools/patches
+    # Recreate emulated VMs each run, dropping all domains then creating vm_count.
+    vm_recreate: "{{ VM_RECREATE | default(true) }}"
+    vm_count: "{{ VM_COUNT | default(1) }}"
+
+  pre_tasks:
+    - name: Assert the host is Debian/Ubuntu on amd64
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution in ["Debian", "Ubuntu"]
+          - ansible_facts.architecture == "x86_64"
+        fail_msg: "worker.yaml supports Debian/Ubuntu amd64 only."
+
+    - name: Wait for cloud-init to finish (only when run at first boot)
+      ansible.builtin.wait_for:
+        path: /var/lib/cloud/instance/boot-finished
+        timeout: 600
+      when: wait_for_cloud_init | bool
+
+  handlers:
+    - name: Restart libvirtd
+      ansible.builtin.systemd_service:
+        name: libvirtd
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart sushy-emulator
+      ansible.builtin.systemd_service:
+        name: sushy-emulator
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
+
+    - name: Install libvirt/KVM hypervisor packages
+      ansible.builtin.apt:
+        name:
+          - libguestfs-tools
+          - libosinfo-bin
+          - libvirt-clients
+          - libvirt-daemon-system
+          - ovmf
+          - qemu-kvm
+          - virtinst
+        state: present
+
+    - name: Load required kernel modules
+      ansible.builtin.command: "modprobe {{ item }}"
+      loop:
+        - kvm
+        - kvm_intel
+        - kvm_amd
+      changed_when: false
+      failed_when: false
+
+    - name: Persist required kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/95-local.conf
+        content: |
+          kvm
+          kvm_intel
+          kvm_amd
+        mode: "0644"
+
+    - name: Configure libvirt QEMU (no security driver, run as root)
+      ansible.builtin.copy:
+        dest: /etc/libvirt/qemu.conf
+        content: |
+          security_driver = "none"
+          user = "root"
+          group = "root"
+          dynamic_ownership = 0
+        mode: "0644"
+      notify: Restart libvirtd
+
+    - name: Enable and start libvirtd
+      ansible.builtin.systemd_service:
+        name: libvirtd
+        enabled: true
+        state: started
+
+    - name: Configure the default libvirt storage pool
+      block:
+        - name: Check whether the default storage pool exists
+          ansible.builtin.command: virsh pool-info default
+          register: default_pool
+          changed_when: false
+          failed_when: false
+
+        - name: Check whether a legacy 'images' pool exists
+          ansible.builtin.command: virsh pool-info images
+          register: images_pool
+          changed_when: false
+          failed_when: false
+          when: default_pool.rc != 0
+
+        - name: Retire the legacy 'images' pool
+          ansible.builtin.command: "virsh {{ item }} images"
+          loop:
+            - pool-destroy
+            - pool-undefine
+          failed_when: false
+          changed_when: true
+          when:
+            - default_pool.rc != 0
+            - images_pool.rc == 0
+
+        - name: Create the default storage pool directory
+          ansible.builtin.file:
+            path: /var/lib/libvirt/images
+            state: directory
+            mode: "0755"
+          when: default_pool.rc != 0
+
+        - name: Define, build, start and autostart the default pool
+          ansible.builtin.command: "{{ item }}"
+          loop:
+            - virsh pool-define-as default dir --target /var/lib/libvirt/images
+            - virsh pool-build default
+            - virsh pool-start default
+            - virsh pool-autostart default
+          changed_when: true
+          failed_when: false
+          when: default_pool.rc != 0
+
+    - name: Configure the provisioning network (macvtap direct to the 2nd NIC)
+      block:
+        - name: Inspect the current provisioning network definition
+          ansible.builtin.command: "virsh net-dumpxml {{ provisioning_network }}"
+          register: prov_net
+          changed_when: false
+          failed_when: false
+
+        - name: Rebuild the provisioning network when missing or misconfigured
+          # Rebuild if it still has an <ip> (a NAT/dnsmasq net) or lacks our NIC.
+          when: >-
+            prov_net.rc != 0
+            or '<ip ' in prov_net.stdout
+            or provisioning_nic not in prov_net.stdout
+          block:
+            - name: Tear down the existing provisioning network
+              ansible.builtin.command: "virsh {{ item }} {{ provisioning_network }}"
+              loop:
+                - net-destroy
+                - net-undefine
+              failed_when: false
+              changed_when: true
+
+            - name: Write the provisioning network XML (macvtap direct)
+              ansible.builtin.copy:
+                dest: "/root/{{ provisioning_network }}-network.xml"
+                mode: "0644"
+                content: |
+                  <network>
+                    <name>{{ provisioning_network }}</name>
+                    <forward mode='bridge'>
+                      <interface dev='{{ provisioning_nic }}'/>
+                    </forward>
+                  </network>
+
+            - name: Define the provisioning network
+              ansible.builtin.command: "virsh net-define /root/{{ provisioning_network }}-network.xml"
+              changed_when: true
+
+        - name: Start the provisioning network
+          ansible.builtin.command: "virsh net-start {{ provisioning_network }}"
+          register: net_start
+          changed_when: "'started' in net_start.stdout"
+          failed_when:
+            - net_start.rc != 0
+            - "'already active' not in net_start.stderr"
+
+        - name: Autostart the provisioning network
+          ansible.builtin.command: "virsh net-autostart {{ provisioning_network }}"
+          changed_when: true
+
+    - name: Apply queued libvirtd changes before starting sushy-tools
+      ansible.builtin.meta: flush_handlers
+
+    # sushy-tools (stock, PyPI) Redfish BMC emulator over libvirt.
+    - name: Install sushy-tools build/runtime dependencies
+      ansible.builtin.apt:
+        name:
+          - apache2-utils   # htpasswd
+          - build-essential
+          - git             # pip installs sushy-tools straight from master
+          - libvirt-dev     # to build libvirt-python in the venv
+          - openssl
+          - patch           # applies the sushy fixes under files/sushy
+          - pkg-config
+          - python3-dev
+          - python3-pip
+          - python3-venv
+        state: present
+
+    - name: Check for an existing Redfish password
+      ansible.builtin.stat:
+        path: /root/.redfish_password
+      register: redfish_password_file
+
+    - name: Read the existing Redfish password
+      ansible.builtin.slurp:
+        src: /root/.redfish_password
+      register: existing_redfish_password
+      when: redfish_password_file.stat.exists
+
+    - name: Reuse the existing Redfish password
+      ansible.builtin.set_fact:
+        redfish_password: "{{ existing_redfish_password.content | b64decode | trim }}"
+      when: redfish_password_file.stat.exists
+
+    - name: Generate a new Redfish password
+      ansible.builtin.set_fact:
+        redfish_password: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_letters', 'digits'], length=16) }}"
+      when: not redfish_password_file.stat.exists
+
+    - name: Create the sushy-tools directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /opt/sushy-tools
+        - "{{ sushy_patch_dest }}"
+        - /etc/sushy
+        - /etc/sushy/ssl
+
+    - name: Create the sushy-tools virtualenv
+      ansible.builtin.command:
+        cmd: python3 -m venv /opt/sushy-tools/venv
+        creates: /opt/sushy-tools/venv/bin/python
+
+    - name: Install libvirt-python into the venv
+      ansible.builtin.pip:
+        name: libvirt-python
+        virtualenv: /opt/sushy-tools/venv
+
+    - name: Install vanilla sushy-tools into the venv
+      ansible.builtin.pip:
+        name: "{{ sushy_tools_pip }}"
+        virtualenv: /opt/sushy-tools/venv
+      notify: Restart sushy-emulator
+
+    # Vanilla sushy leaves gaps libredfish's native Sushy vendor does not cover,
+    # so lift only the fork commits a failure actually calls for
+    - name: Stage the sushy patches on the worker
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ sushy_patch_dest }}/"
+        mode: "0644"
+      loop: "{{ query('fileglob', sushy_patch_glob) | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    # Cut against the sushy-tools repo root, so -p1 lands inside site-packages.
+    # Reverse first tells an applied patch apart from one master has drifted past
+    - name: Apply sushy patches into the venv
+      ansible.builtin.shell: |
+        set -euo pipefail
+        SP=$(/opt/sushy-tools/venv/bin/python -c \
+          'import os, sushy_tools; print(os.path.dirname(os.path.dirname(sushy_tools.__file__)))')
+        P={{ (sushy_patch_dest ~ '/' ~ (item | basename)) | quote }}
+        if patch -p1 --dry-run --reverse -d "$SP" <"$P" >/dev/null 2>&1; then
+          echo "ALREADY {{ item | basename }}"
+        elif patch -p1 --dry-run --forward -d "$SP" <"$P" >/dev/null 2>&1; then
+          patch -p1 --forward -d "$SP" <"$P"
+          echo PATCHED
+        else
+          echo "{{ item | basename }} does not apply to this sushy-tools." >&2
+          echo "Refresh it or pin SUSHY_TOOLS_PIP to a known-good commit." >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ query('fileglob', sushy_patch_glob) | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      register: sushy_patch_apply
+      changed_when: "'PATCHED' in sushy_patch_apply.stdout"
+      notify: Restart sushy-emulator
+
+    - name: Generate the sushy-tools TLS private key
+      ansible.builtin.command:
+        cmd: openssl genrsa -out /etc/sushy/sushy.key 2048
+        creates: /etc/sushy/sushy.key
+
+    - name: Generate the sushy-tools self-signed certificate
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -new -x509 -key /etc/sushy/sushy.key
+          -out /etc/sushy/sushy.cert -days 365
+          -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+        creates: /etc/sushy/sushy.cert
+
+    - name: Lock down the TLS files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - /etc/sushy/sushy.key
+        - /etc/sushy/sushy.cert
+
+    - name: Create the Redfish htpasswd file
+      ansible.builtin.command:
+        cmd: "htpasswd -cbB /etc/sushy/htpasswd admin {{ redfish_password }}"
+      changed_when: true
+      notify: Restart sushy-emulator
+
+    - name: Lock down the htpasswd file
+      ansible.builtin.file:
+        path: /etc/sushy/htpasswd
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Persist the Redfish password
+      ansible.builtin.copy:
+        content: "{{ redfish_password }}"
+        dest: /root/.redfish_password
+        mode: "0600"
+        owner: root
+        group: root
+
+    - name: Write the sushy-tools configuration (stock options only)
+      ansible.builtin.copy:
+        dest: /etc/sushy/sushy-emulator.conf
+        mode: "0644"
+        content: |
+          SUSHY_EMULATOR_LISTEN_IP = '0.0.0.0'
+          SUSHY_EMULATOR_LISTEN_PORT = {{ redfish_port }}
+          SUSHY_EMULATOR_VENDOR = '{{ redfish_vendor }}'
+          SUSHY_EMULATOR_OS_CLOUD = None
+          SUSHY_EMULATOR_LIBVIRT_URI = 'qemu:///system'
+          SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = False
+          SUSHY_EMULATOR_FEATURE_SET = 'full'
+          SUSHY_EMULATOR_AUTH_FILE = '/etc/sushy/htpasswd'
+          SUSHY_EMULATOR_SSL_CERT = '/etc/sushy/sushy.cert'
+          SUSHY_EMULATOR_SSL_KEY = '/etc/sushy/sushy.key'
+          SUSHY_EMULATOR_BOOT_LOADER_MAP = {
+              'UEFI': {'x86_64': '/usr/share/OVMF/OVMF_CODE.fd'},
+              'Legacy': {'x86_64': None},
+          }
+          SUSHY_EMULATOR_VMEDIA_DEVICES = {
+              'Cd': {'Name': 'Virtual CD', 'MediaTypes': ['CD', 'DVD']},
+          }
+          SUSHY_EMULATOR_VMEDIA_VERIFY_SSL = False
+      notify: Restart sushy-emulator
+
+    - name: Write the sushy-emulator start script
+      ansible.builtin.copy:
+        dest: /opt/sushy-tools/sushy-emulator.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -eu -o pipefail
+          # shellcheck source=/dev/null
+          source /opt/sushy-tools/venv/bin/activate
+          exec /opt/sushy-tools/venv/bin/sushy-emulator \
+              --config /etc/sushy/sushy-emulator.conf
+
+    - name: Install the sushy-emulator systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/sushy-emulator.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Sushy Tools Redfish Emulator
+          Documentation=https://docs.openstack.org/sushy-tools/
+          After=network.target libvirtd.service
+          Requires=libvirtd.service
+
+          [Service]
+          Type=simple
+          User=root
+          Group=root
+          WorkingDirectory=/opt/sushy-tools
+          ExecStart=/opt/sushy-tools/sushy-emulator.sh
+          Restart=always
+          RestartSec=10
+          TimeoutStartSec=60
+          TimeoutStopSec=30
+          Environment=PYTHONUNBUFFERED=1
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ReadWritePaths=/opt/sushy-tools /var/lib/libvirt /run/libvirt
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart sushy-emulator
+
+    - name: Enable and start sushy-emulator
+      ansible.builtin.systemd_service:
+        name: sushy-emulator
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Recreate the emulated bare metal VMs, dropping every domain then creating a
+    # fresh set. Blank UEFI disks on the macvtap net that NICo powers and PXE boots.
+    - name: Install the create-vm helper
+      ansible.builtin.copy:
+        dest: /usr/local/bin/create-vm
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [[ $# -ne 2 ]]; then
+              echo "Usage: $0 NODE_INDEX NETWORK_NAME" >&2
+              echo "Example: $0 1 default" >&2
+              exit 1
+          fi
+
+          NODE_INDEX="$1"
+          NETWORK_NAME="$2"
+          if ! [[ "$NODE_INDEX" =~ ^[0-9]+$ ]]; then
+              echo "Error: NODE_INDEX must be a number" >&2
+              exit 1
+          fi
+
+          VM_NAME="node${NODE_INDEX}"
+          DISK_PATH="/var/lib/libvirt/images/${VM_NAME}-disk.qcow2"
+          DISK_SERIAL="node-disk-$(printf "%03d" "$NODE_INDEX")"
+          MAC_ADDRESS="52:54:00:12:34:$(printf "%02x" "$NODE_INDEX")"
+
+          # network,hd leads the boot list to give the NIC bootindex 1 and the disk
+          # 2, which strict boot needs. uefi and firmware.* parse as separate keys
+          BOOT_OPTS="network,hd,uefi"
+          BOOT_OPTS="${BOOT_OPTS},firmware.feature0.name=enrolled-keys,firmware.feature0.enabled=no"
+          BOOT_OPTS="${BOOT_OPTS},firmware.feature1.name=secure-boot,firmware.feature1.enabled=yes"
+
+          # /run is a share of RAM and the scout loader stages scout.squashfs
+          # there, so too little RAM fails the download.
+          virt-install \
+              --name "$VM_NAME" \
+              --vcpus "6" \
+              --ram "14336" \
+              --os-variant "debian12" \
+              --connect "qemu:///system" \
+              --disk "path=${DISK_PATH},bus=virtio,size=60,format=qcow2,discard=unmap,serial=${DISK_SERIAL}" \
+              --disk "device=cdrom,bus=sata" \
+              --network "network=${NETWORK_NAME},mac=${MAC_ADDRESS}" \
+              --console "pty,target.type=virtio" \
+              --serial "pty" \
+              --graphics "vnc,listen=0.0.0.0" \
+              --import \
+              --noautoconsole \
+              --noreboot \
+              --boot "$BOOT_OPTS"
+
+    - name: Drop all existing VMs
+      ansible.builtin.shell: |
+        for d in $(virsh list --all --name); do
+          virsh destroy "$d" 2>/dev/null || true
+          virsh undefine "$d" --nvram --remove-all-storage 2>/dev/null || true
+        done
+      changed_when: true
+      when: vm_recreate | bool
+
+    - name: Create the emulated VMs (node1..nodeN)
+      ansible.builtin.command: "/usr/local/bin/create-vm {{ item }} {{ provisioning_network }}"
+      loop: "{{ range(1, (vm_count | int) + 1) | list }}"
+      changed_when: true
+      when: vm_recreate | bool
+
+    # Vanilla sushy keys the System by libvirt UUID, and NICo matches the serial the
+    # fork would derive from it, so report both alongside the boot MAC
+    - name: Collect the emulated VM identities
+      ansible.builtin.shell: |
+        set -o pipefail
+        for d in $(virsh list --all --name); do
+          [ -n "$d" ] || continue
+          u=$(virsh domuuid "$d" | tr -d '[:space:]')
+          m=$(virsh domiflist "$d" | awk 'NR > 2 && NF >= 5 { print $5; exit }')
+          printf '%s uuid=%s SERIAL=%s BOOT_MAC=%s\n' \
+            "$d" "$u" "$(printf '%s' "$u" | tr -d - | tr '[:lower:]' '[:upper:]')" "$m"
+        done
+      args:
+        executable: /bin/bash
+      register: worker_domains
+      changed_when: false
+
+    # env.sh derives all of this over ssh, so treat it as a cross check
+    - name: Show the Redfish endpoint and the values env.sh needs
+      ansible.builtin.debug:
+        msg: "{{ [
+                'Redfish  https://' ~ ansible_host ~ ':' ~ redfish_port ~ '/redfish/v1/',
+                'BMC_IP=' ~ ansible_host,
+                'BMC_PORT=' ~ redfish_port,
+                'BMC_USERNAME=admin',
+                'BMC_PASSWORD=' ~ redfish_password,
+              ] + worker_domains.stdout_lines }}"

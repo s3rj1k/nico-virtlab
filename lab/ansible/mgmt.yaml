@@ -1,0 +1,703 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# Single node k0s (containerd + Calico) for the lab mgmt VM, run from builder against
+# the inventory. Control plane also runs workloads. mgmt IPs 10.42.71.102 and 192.168.42.102.
+
+- name: Single-node k0s control plane on the lab mgmt node
+  hosts: mgmt
+  become: true
+  gather_facts: true
+
+  vars:
+    # Wait for the target's cloud-init when it was just provisioned from heat
+    wait_for_cloud_init: "{{ CLOUD_INIT | default(false) }}"
+    # Where the admin kubeconfig is written back on builder, the controller side
+    kubeconfig_dest: "{{ KUBECONFIG_DEST | default(lookup('env', 'HOME') ~ '/.kube/config') }}"
+    # k0s minor track, the latest matching patch is resolved at run time.
+    k0s_major_minor: "1.35"
+    # API and etcd bind IP, the mgmt primary that Calico can-reach autodetects.
+    api_address: "10.42.71.102"
+    # API off 9443 so BMO's hostNetwork :9443 webhook can bind later.
+    k0s_api_port: 9643
+    # Extra API cert SANs (local net + loopback).
+    api_sans:
+      - "192.168.42.102"
+      - "127.0.0.1"
+      - "localhost"
+    # Reprovision by resetting an existing k0s and reinstalling. false leaves it.
+    k0s_reset_if_present: true
+    # The mgmt host provisioning L2 address. Kea VIP and the relay both have to sit
+    # on this subnet.
+    mgmt_provisioning_ip: "{{ MGMT_SECONDARY_IP | default('192.168.42.102') }}"
+    # Kea VIP that MetalLB assigns, so confirm it after a rebuild. Empty disables
+    # the relay.
+    dhcp_server: "{{ DHCP_SERVER | default('192.168.42.201') }}"
+    dhcp_relay_image: "ghcr.io/mirantis/dhcp-relay:latest"
+    dhcp_relay_image_bin: "/usr/local/bin/dhcp-relay"   # binary path inside the image
+    dhcp_relay_bin: "/usr/local/bin/dhcp-relay"
+    dhcp_relay_extra_args: ""
+    # Gateway address must match the segment gateway nico hands out via DHCP,
+    # see the networks entry in the nico core values.
+    nat_enabled: true
+    nat_wan_iface: "{{ NAT_WAN_IFACE | default('ens3') }}"
+    nat_lan_iface: "{{ NAT_LAN_IFACE | default('ens4') }}"
+    provisioning_gateway_ip: "{{ PROVISIONING_GATEWAY_IP | default('192.168.42.1') }}"
+    provisioning_subnet: "{{ PROVISIONING_SUBNET | default('192.168.42.0/24') }}"
+    # Kea answers a relayed request by sending to giaddr, which is a fresh packet
+    # rather than a tracked reply, so it follows the default route out the uplink.
+    dhcp_reply_route_enabled: true
+    dhcp_reply_lan_iface: "{{ nat_lan_iface }}"
+    dhcp_reply_gateway: "{{ provisioning_gateway_ip }}"
+    # k0s default, the cluster config below sets no podCIDR of its own.
+    dhcp_reply_pod_cidr: "{{ POD_CIDR | default('10.244.0.0/16') }}"
+    # Doubles as the rule preference, so both are visible under one number.
+    dhcp_reply_table: 100
+    # In cluster CoreDNS, the resolver booted machines use. Recurses to WAN, forwards
+    # the NICo zone to nico-dns and is exposed on the mgmt 2nd NIC by externalIPs.
+    coredns_enabled: true
+    coredns_image: "docker.io/coredns/coredns:1.14.6"
+    coredns_external_ip: "{{ mgmt_provisioning_ip }}"
+    # NICo authoritative zone, match nico-api initial_domain_name in nico-core.yaml.
+    coredns_nico_zone: "{{ NICO_ZONE | default('192.168.42.10.sslip.io') }}"
+    # nico-dns ClusterIP, match nico-dns.service.clusterIP in nico-core.yaml.
+    coredns_nico_dns_ip: "{{ NICO_DNS_CLUSTERIP | default('10.96.0.53') }}"
+    # Upstream resolvers for everything else (space-separated).
+    coredns_wan_forward: "{{ WAN_DNS | default('8.8.8.8 1.1.1.1') }}"
+    # Static .forge records (replaces unbound localData), matching the NICo service
+    # VIPs pinned in nico-core.yaml (patch 0011). Each item is "IP name1 name2 ...".
+    coredns_forge_records:
+      - "192.168.42.211 carbide-api.forge nico-api.forge"
+      - "192.168.42.204 carbide-pxe.forge nico-pxe.forge carbide-static-pxe.forge"
+      - "192.168.42.206 carbide-ntp.forge nico-ntp.forge"
+      - "192.168.42.207 carbide-ntp.forge nico-ntp.forge"
+      - "192.168.42.208 carbide-ntp.forge nico-ntp.forge"
+
+  pre_tasks:
+    - name: Assert the host is Debian/Ubuntu on amd64
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution in ["Debian", "Ubuntu"]
+          - ansible_facts.architecture == "x86_64"
+        fail_msg: "mgmt.yaml supports Debian/Ubuntu amd64 only."
+
+    - name: Wait for cloud-init to finish (only when run at first boot)
+      ansible.builtin.wait_for:
+        path: /var/lib/cloud/instance/boot-finished
+        timeout: 600
+      when: wait_for_cloud_init | bool
+
+  handlers:
+    - name: Restart dhcp-relay
+      ansible.builtin.systemd_service:
+        name: dhcp-relay
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart lab-provisioning-nat
+      ansible.builtin.systemd_service:
+        name: lab-provisioning-nat
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart lab-dhcp-reply-route
+      ansible.builtin.systemd_service:
+        name: lab-dhcp-reply-route
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - jq
+        state: present
+
+    - name: Resolve the latest k0s patch release for series {{ k0s_major_minor }}
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          curl -fsSL "https://api.github.com/repos/k0sproject/k0s/releases" \
+            | jq -r '.[] | select(.tag_name | test("^v{{ k0s_major_minor | replace(".", "\\.") }}\\.[0-9]+\\+k0s\\.[0-9]+$")) | .tag_name' \
+            | head -1
+        executable: /bin/bash
+      register: k0s_release
+      changed_when: false
+
+    - name: Ensure a k0s release was found
+      ansible.builtin.assert:
+        that: k0s_release.stdout | length > 0
+        fail_msg: "No k0s {{ k0s_major_minor }} release found via the GitHub API."
+
+    - name: Install the k0s binary {{ k0s_release.stdout }}
+      ansible.builtin.get_url:
+        url: "https://github.com/k0sproject/k0s/releases/download/{{ k0s_release.stdout }}/k0s-{{ k0s_release.stdout }}-amd64"
+        dest: /usr/local/bin/k0s
+        mode: "0755"
+
+    # Tear down any prior k0s first so /etc/k0s below is written after reset,
+    # which wipes cluster state, /var/lib/k0s and the systemd unit.
+    - name: Detect an existing k0s controller
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k0scontroller.service
+      register: k0s_present
+
+    - name: Nuke the existing k0s cluster before reprovisioning
+      when: k0s_present.stat.exists and k0s_reset_if_present
+      block:
+        - name: Stop the running k0s controller
+          ansible.builtin.command: k0s stop
+          changed_when: true
+          failed_when: false
+
+        - name: Reset k0s (wipes cluster state, data and the systemd unit)
+          ansible.builtin.command: k0s reset --kubelet-root-dir=/var/lib/kubelet
+          changed_when: true
+          failed_when: false
+
+    - name: Create the k0s config directory
+      ansible.builtin.file:
+        path: /etc/k0s
+        state: directory
+        mode: "0755"
+
+    - name: Create the k0s containerd drop-in directory
+      ansible.builtin.file:
+        path: /etc/k0s/containerd.d
+        state: directory
+        mode: "0755"
+
+    # Drop compressed blobs after unpack, about half the disk. They re-pull if GC'd.
+    # https://docs.k0sproject.io/head/runtime/
+    - name: Discard unpacked layer blobs to halve per-image disk cost
+      ansible.builtin.copy:
+        dest: /etc/k0s/containerd.d/10-discard-unpacked-layers.toml
+        content: |
+          [plugins."io.containerd.grpc.v1.cri".containerd]
+            discard_unpacked_layers = true
+        mode: "0644"
+
+    - name: Write the k0s cluster config
+      ansible.builtin.copy:
+        dest: /etc/k0s/k0s.yaml
+        mode: "0644"
+        content: |
+          apiVersion: k0s.k0sproject.io/v1beta1
+          kind: ClusterConfig
+          metadata:
+            name: k0s
+            namespace: kube-system
+          spec:
+            api:
+              address: {{ api_address }}
+              k0sApiPort: {{ k0s_api_port }}
+              sans: {{ api_sans | to_json }}
+            telemetry:
+              enabled: false
+            storage:
+              type: etcd
+              etcd:
+                peerAddress: {{ api_address }}
+            network:
+              provider: calico
+              dualStack:
+                enabled: false
+              calico:
+                mode: vxlan
+                mtu: 1400
+                overlay: Always
+                ipAutodetectionMethod: can-reach=8.8.8.8
+                envVars:
+                  FELIX_IGNORELOOSERPF: "true"
+                  FELIX_ALLOWVXLANPACKETSFROMWORKLOADS: "true"
+            featureGates:
+              - name: ImageVolume
+                enabled: true
+            workerProfiles:
+              - name: numa
+                values:
+                  topologyManagerPolicy: "best-effort"
+                  cpuManagerPolicy: "static"
+                  cpuManagerPolicyOptions:
+                    full-pcpus-only: "true"
+                    distribute-cpus-across-numa: "true"
+                  reservedSystemCPUs: "0"
+                  # aggressive image GC so build layers don't accumulate
+                  imageGCHighThresholdPercent: 60
+                  imageGCLowThresholdPercent: 50
+                  imageMinimumGCAge: 1m
+                  # absolute eviction thresholds (percentage defaults too lax here)
+                  evictionHard:
+                    memory.available: "500Mi"
+                    nodefs.available: "5Gi"
+                    imagefs.available: "5Gi"
+                  evictionMinimumReclaim:
+                    memory.available: "0Mi"
+                    nodefs.available: "1Gi"
+                    imagefs.available: "2Gi"
+                  reservedMemory:
+                    - limits:
+                        memory: 2Gi
+                      numaNode: 0
+                  kubeReservedCgroup: ""
+
+    - name: Create the k0scontroller systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/k0scontroller.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Raise file descriptors and OOM-protect k0scontroller
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k0scontroller.service.d/override.conf
+        content: |
+          [Service]
+          LimitNOFILE=1048576
+          OOMScoreAdjust=-999
+        mode: "0644"
+
+    - name: Install k0s as a single-node controller+worker
+      ansible.builtin.command:
+        cmd: >-
+          k0s install controller -c /etc/k0s/k0s.yaml
+          --enable-dynamic-config --disable-components=konnectivity-server
+          --enable-worker --no-taints --profile numa
+          --kubelet-root-dir=/var/lib/kubelet --verbose
+      changed_when: true
+      # Fresh node, or we just reset. Skip only when leaving a cluster in place.
+      when: k0s_reset_if_present or not k0s_present.stat.exists
+
+    - name: Start and enable k0scontroller (picks up the drop-in override)
+      ansible.builtin.systemd_service:
+        name: k0scontroller.service
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for the k0s admin kubeconfig
+      ansible.builtin.wait_for:
+        path: /var/lib/k0s/pki/admin.conf
+        timeout: 300
+
+    # Node Ready implies Calico (auto-deployed by k0s) has rolled out.
+    - name: Wait for the node to become Ready
+      ansible.builtin.command:
+        cmd: k0s kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      environment:
+        KUBECONFIG: /var/lib/k0s/pki/admin.conf
+      register: node_ready
+      changed_when: false
+      until: node_ready.rc == 0
+      retries: 30
+      delay: 30
+
+    - name: Read the admin kubeconfig
+      ansible.builtin.command: k0s kubeconfig admin
+      register: mgmt_kubeconfig
+      changed_when: false
+
+    - name: Ensure the builder kube directory
+      ansible.builtin.file:
+        path: "{{ kubeconfig_dest | dirname }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    # k0s emits api.address, which the cert already covers. A loopback server is
+    # rewritten anyway, it would otherwise point back at builder itself
+    - name: Write the kubeconfig onto the builder
+      ansible.builtin.copy:
+        content: "{{ mgmt_kubeconfig.stdout | replace('localhost', ansible_host) | replace('127.0.0.1', ansible_host) }}"
+        dest: "{{ kubeconfig_dest }}"
+        mode: "0600"
+        backup: true
+      delegate_to: localhost
+      become: false
+
+    # DHCPv4 relay (ghcr.io/mirantis/dhcp-relay) forwards provisioning-L2 DHCP to
+    # NICo's Kea. Binary extracted from the image via docker pull + cp.
+    - name: Install and configure the DHCPv4 relay
+      when: dhcp_server | length > 0
+      block:
+        # A destination off the provisioning L2 is silently swallowed. 172.17.1.201
+        # routed into the docker0 bridge, so relayed packets vanished and Kea saw none.
+        - name: Assert the relay destination sits on the provisioning L2
+          ansible.builtin.assert:
+            that:
+              - dhcp_server.split('.')[0:3] == mgmt_provisioning_ip.split('.')[0:3]
+            fail_msg: >-
+              dhcp_server {{ dhcp_server }} is not on the provisioning L2
+              {{ mgmt_provisioning_ip }}/24. Set DHCP_SERVER to the
+              nico-dhcp-external LoadBalancer VIP, or leave it unset to take the
+              default.
+            success_msg: "relay destination {{ dhcp_server }} is on the provisioning L2"
+
+        - name: Install Docker (used to pull the relay image)
+          ansible.builtin.apt:
+            name: docker.io
+            state: present
+
+        - name: Ensure Docker is running
+          ansible.builtin.systemd_service:
+            name: docker
+            state: started
+            enabled: true
+
+        - name: Pull the dhcp-relay image
+          ansible.builtin.command: "docker pull {{ dhcp_relay_image }}"
+          register: dhcp_relay_pull
+          changed_when: true
+          until: dhcp_relay_pull.rc == 0
+          retries: 5
+          delay: 3
+
+        - name: Extract the relay binary from the image
+          block:
+            - name: Remove any stale extract container
+              ansible.builtin.command: docker rm -f dhcp-relay-extract
+              changed_when: false
+              failed_when: false
+
+            - name: Create a container from the relay image
+              # Image has no entrypoint or cmd, so docker create needs a placeholder.
+              ansible.builtin.command: "docker create --name dhcp-relay-extract {{ dhcp_relay_image }} true"
+              changed_when: true
+
+            - name: Copy the relay binary out of the container
+              ansible.builtin.command: "docker cp dhcp-relay-extract:{{ dhcp_relay_image_bin }} {{ dhcp_relay_bin }}"
+              changed_when: true
+              notify: Restart dhcp-relay
+          always:
+            - name: Remove the extract container
+              ansible.builtin.command: docker rm -f dhcp-relay-extract
+              changed_when: false
+              failed_when: false
+
+        - name: Ensure the relay binary is executable
+          ansible.builtin.file:
+            path: "{{ dhcp_relay_bin }}"
+            mode: "0755"
+
+        - name: Install the dhcp-relay systemd unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/dhcp-relay.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=DHCPv4 relay to {{ dhcp_server }}
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              ExecStart={{ dhcp_relay_bin }} -dhcp-server-address {{ dhcp_server }} -log-no-datetime {{ dhcp_relay_extra_args }}
+              Restart=on-failure
+              RestartSec=2
+
+              [Install]
+              WantedBy=multi-user.target
+          notify: Restart dhcp-relay
+
+        - name: Enable and start dhcp-relay
+          ansible.builtin.systemd_service:
+            name: dhcp-relay
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    - name: Note when the DHCP relay is skipped
+      ansible.builtin.debug:
+        msg: "DHCP relay skipped; set DHCP_SERVER to a Kea VIP to install it."
+      when: dhcp_server | length == 0
+
+    # Nothing owned the segment gateway address, so provisioned hosts had no
+    # egress and the qcow imager could not pull its OS image.
+    - name: Route and NAT the provisioning subnet
+      when: nat_enabled
+      block:
+        # Builtin only, so write a sysctl file and apply it rather than the posix
+        # sysctl module.
+        - name: Persist IPv4 forwarding
+          ansible.builtin.copy:
+            dest: /etc/sysctl.d/99-lab-provisioning-nat.conf
+            mode: "0644"
+            content: |
+              net.ipv4.ip_forward = 1
+
+        - name: Apply IPv4 forwarding
+          ansible.builtin.command: sysctl --system
+          changed_when: false
+
+        # A /32 alias avoids a duplicate route for a subnet already covered.
+        - name: Install the provisioning gateway and NAT rules
+          ansible.builtin.copy:
+            dest: /usr/local/sbin/lab-provisioning-nat
+            mode: "0755"
+            content: |
+              #!/bin/bash
+              # Idempotent, safe to rerun on every boot.
+              set -euo pipefail
+              ip addr show {{ nat_lan_iface }} | grep -q 'inet {{ provisioning_gateway_ip }}/32' \
+                || ip addr add {{ provisioning_gateway_ip }}/32 dev {{ nat_lan_iface }}
+              iptables -t nat -C POSTROUTING -s {{ provisioning_subnet }} -o {{ nat_wan_iface }} -j MASQUERADE 2>/dev/null \
+                || iptables -t nat -A POSTROUTING -s {{ provisioning_subnet }} -o {{ nat_wan_iface }} -j MASQUERADE
+              iptables -C FORWARD -i {{ nat_lan_iface }} -o {{ nat_wan_iface }} -j ACCEPT 2>/dev/null \
+                || iptables -I FORWARD 1 -i {{ nat_lan_iface }} -o {{ nat_wan_iface }} -j ACCEPT
+              iptables -C FORWARD -i {{ nat_wan_iface }} -o {{ nat_lan_iface }} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+                || iptables -I FORWARD 2 -i {{ nat_wan_iface }} -o {{ nat_lan_iface }} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          notify: Restart lab-provisioning-nat
+
+        # Oneshot rather than the persistent iptables package so the address and
+        # rules reapply together.
+        - name: Install the provisioning NAT unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/lab-provisioning-nat.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Gateway address and NAT for the provisioning subnet
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=true
+              ExecStart=/usr/local/sbin/lab-provisioning-nat
+
+              [Install]
+              WantedBy=multi-user.target
+          notify: Restart lab-provisioning-nat
+
+        - name: Enable and start the provisioning NAT unit
+          ansible.builtin.systemd_service:
+            name: lab-provisioning-nat
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # Without this the reply leaves by the default route on the uplink and the relay
+    # never sees it, so the host retries discovery until it gives up and boots disk.
+    - name: Route DHCP replies out the provisioning NIC
+      when: dhcp_reply_route_enabled
+      block:
+        - name: Install the DHCP reply routing script
+          ansible.builtin.copy:
+            dest: /usr/local/sbin/lab-dhcp-reply-route
+            mode: "0755"
+            content: |
+              #!/bin/bash
+              # Idempotent, safe to rerun on every boot.
+              set -euo pipefail
+              ip rule show | grep -qF "{{ dhcp_reply_pod_cidr }} ipproto udp dport 67" \
+                || ip rule add from {{ dhcp_reply_pod_cidr }} ipproto udp dport 67 \
+                   lookup {{ dhcp_reply_table }} pref {{ dhcp_reply_table }}
+              ip route replace default via {{ dhcp_reply_gateway }} \
+                dev {{ dhcp_reply_lan_iface }} table {{ dhcp_reply_table }}
+          notify: Restart lab-dhcp-reply-route
+
+        # Oneshot for the same reason as the NAT unit, the rule and the route have
+        # to reapply together after a reboot.
+        - name: Install the DHCP reply routing unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/lab-dhcp-reply-route.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Policy route for DHCP replies out {{ dhcp_reply_lan_iface }}
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=true
+              ExecStart=/usr/local/sbin/lab-dhcp-reply-route
+
+              [Install]
+              WantedBy=multi-user.target
+          notify: Restart lab-dhcp-reply-route
+
+        - name: Enable and start the DHCP reply routing unit
+          ansible.builtin.systemd_service:
+            name: lab-dhcp-reply-route
+            enabled: true
+            state: started
+            daemon_reload: true
+
+        # The source port half is handled by externalTrafficPolicy Local on
+        # nico-dhcp-external, applied by lab patch 0013.
+        - name: Show the resulting rule and routing table
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              ip rule show | grep 'dport 67' || true
+              ip route show table {{ dhcp_reply_table }}
+            executable: /bin/bash
+          register: dhcp_reply_state
+          changed_when: false
+
+        - name: Report the DHCP reply route
+          ansible.builtin.debug:
+            var: dhcp_reply_state.stdout_lines
+
+    # In cluster CoreDNS resolver for booted machines, forwarding the NICo zone to
+    # nico-dns on the mgmt 2nd NIC so nico-dhcp can hand it out as the nameserver.
+    - name: Deploy the in-cluster CoreDNS resolver
+      when: coredns_enabled
+      environment:
+        KUBECONFIG: /var/lib/k0s/pki/admin.conf
+      block:
+        - name: Create the CoreDNS config directory
+          ansible.builtin.file:
+            path: /etc/coredns
+            state: directory
+            mode: "0755"
+
+        - name: Write the CoreDNS Corefile
+          ansible.builtin.copy:
+            dest: /etc/coredns/Corefile
+            mode: "0644"
+            content: |
+              {% if coredns_nico_zone | length > 0 %}
+              {{ coredns_nico_zone }}:53 {
+                  errors
+                  forward . {{ coredns_nico_dns_ip }}
+                  cache 30
+              }
+              {% endif %}
+              {% if coredns_forge_records | length > 0 %}
+              forge:53 nico:53 {
+                  errors
+                  hosts {
+              {% for rec in coredns_forge_records %}
+                      {{ rec }}
+              {% endfor %}
+                      ttl 60
+                      fallthrough
+                  }
+              }
+              {% endif %}
+              unknowndomain:53 {
+                  template ANY ANY {
+                      rcode NXDOMAIN
+                  }
+              }
+              .:53 {
+                  errors
+                  health {
+                      lameduck 5s
+                  }
+                  ready
+                  forward . {{ coredns_wan_forward }}
+                  cache 30
+                  loop
+                  reload
+              }
+
+        - name: Write the CoreDNS Deployment and Service manifest
+          ansible.builtin.copy:
+            dest: /etc/coredns/lab-coredns.yaml
+            mode: "0644"
+            content: |
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: coredns
+                namespace: lab-dns
+                labels:
+                  app: coredns
+              spec:
+                replicas: 1
+                selector:
+                  matchLabels:
+                    app: coredns
+                template:
+                  metadata:
+                    labels:
+                      app: coredns
+                  spec:
+                    containers:
+                      - name: coredns
+                        image: {{ coredns_image }}
+                        args: ["-conf", "/etc/coredns/Corefile"]
+                        ports:
+                          - containerPort: 53
+                            protocol: UDP
+                            name: dns
+                          - containerPort: 53
+                            protocol: TCP
+                            name: dns-tcp
+                        livenessProbe:
+                          httpGet:
+                            path: /health
+                            port: 8080
+                          initialDelaySeconds: 10
+                          periodSeconds: 10
+                        readinessProbe:
+                          httpGet:
+                            path: /ready
+                            port: 8181
+                          initialDelaySeconds: 5
+                          periodSeconds: 10
+                        resources:
+                          requests:
+                            cpu: 50m
+                            memory: 64Mi
+                          limits:
+                            memory: 170Mi
+                        volumeMounts:
+                          - name: config
+                            mountPath: /etc/coredns
+                            readOnly: true
+                    volumes:
+                      - name: config
+                        configMap:
+                          name: coredns
+                          items:
+                            - key: Corefile
+                              path: Corefile
+              ---
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: coredns
+                namespace: lab-dns
+                labels:
+                  app: coredns
+              spec:
+                type: ClusterIP
+                externalIPs:
+                  - {{ coredns_external_ip }}
+                selector:
+                  app: coredns
+                ports:
+                  - name: dns
+                    port: 53
+                    protocol: UDP
+                    targetPort: 53
+                  - name: dns-tcp
+                    port: 53
+                    protocol: TCP
+                    targetPort: 53
+
+        - name: Apply the CoreDNS namespace, config, and workload
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              k0s kubectl get namespace lab-dns >/dev/null 2>&1 || k0s kubectl create namespace lab-dns
+              k0s kubectl create configmap coredns -n lab-dns \
+                --from-file=Corefile=/etc/coredns/Corefile \
+                --dry-run=client -o yaml | k0s kubectl apply -f -
+              k0s kubectl apply -f /etc/coredns/lab-coredns.yaml
+            executable: /bin/bash
+          register: coredns_apply
+          changed_when: "'created' in coredns_apply.stdout or 'configured' in coredns_apply.stdout"
+
+    # Post-k0s mgmt setup goes below (KUBECONFIG=/var/lib/k0s/pki/admin.conf).

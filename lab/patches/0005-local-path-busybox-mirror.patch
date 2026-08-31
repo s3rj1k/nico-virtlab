@@ -1,0 +1,11 @@
+diff --git a/helm-prereqs/operators/local-path-provisioner.yaml b/helm-prereqs/operators/local-path-provisioner.yaml
+index 928c76604..b9e1a123c 100644
+--- a/helm-prereqs/operators/local-path-provisioner.yaml
++++ b/helm-prereqs/operators/local-path-provisioner.yaml
+@@ -157,5 +157,5 @@ data:
+           effect: NoSchedule
+       containers:
+       - name: helper-pod
+-        image: busybox
++        image: mirror.gcr.io/library/busybox:1.36
+         imagePullPolicy: IfNotPresent

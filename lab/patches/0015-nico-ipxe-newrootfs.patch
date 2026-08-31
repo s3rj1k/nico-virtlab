@@ -1,0 +1,26 @@
+diff --git a/crates/api-core/src/ipxe.rs b/crates/api-core/src/ipxe.rs
+index e65827911..b0511336d 100644
+--- a/crates/api-core/src/ipxe.rs
++++ b/crates/api-core/src/ipxe.rs
+@@ -210,7 +210,9 @@ impl PxeInstructions {
+                 if machine_type == MachineType::Host || machine_type == MachineType::PredictedHost {
+                     InstructionGenerator {
+                         kernel: "${base-url}/internal/aarch64/scout.efi".to_string(),
+-                        command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url]"),
++                        // newrootfs points scout-loader-rclocal at this env's squashfs blob host.
++                        // Without it the loader falls back to a hardcoded carbide-static-pxe.forge name.
++                        command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url] newrootfs=${{base-url}}/internal/aarch64/scout.squashfs"),
+                         initrd: None,
+                     }
+                 }
+@@ -226,7 +228,9 @@ impl PxeInstructions {
+             rpc::MachineArchitecture::X86 => {
+                 InstructionGenerator {
+                     kernel: "${base-url}/internal/x86_64/scout.efi".to_string(),
+-                    command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url]"),
++                    // newrootfs points scout-loader-rclocal at this env's squashfs blob host.
++                    // Without it the loader falls back to a hardcoded carbide-static-pxe.forge name.
++                    command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url] newrootfs=${{base-url}}/internal/x86_64/scout.squashfs"),
+                     initrd: None,
+                 }
+             }

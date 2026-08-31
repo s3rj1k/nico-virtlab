@@ -1,0 +1,26 @@
+diff --git a/helm/charts/nico-dhcp/templates/external-service.yaml b/helm/charts/nico-dhcp/templates/external-service.yaml
+index 8632651bf..4b7c7eeb7 100644
+--- a/helm/charts/nico-dhcp/templates/external-service.yaml
++++ b/helm/charts/nico-dhcp/templates/external-service.yaml
+@@ -12,6 +12,9 @@ metadata:
+   {{- end }}
+ spec:
+   type: {{ .Values.externalService.type | default "LoadBalancer" }}
++  {{- if .Values.externalService.externalTrafficPolicy }}
++  externalTrafficPolicy: {{ .Values.externalService.externalTrafficPolicy }}
++  {{- end }}
+   internalTrafficPolicy: Local
+   selector:
+     {{- include "nico-dhcp.selectorLabels" . | nindent 4 }}
+diff --git a/helm/charts/nico-dhcp/values.yaml b/helm/charts/nico-dhcp/values.yaml
+index 71ff522df..aed7f3341 100644
+--- a/helm/charts/nico-dhcp/values.yaml
++++ b/helm/charts/nico-dhcp/values.yaml
+@@ -226,4 +226,7 @@ serviceMonitor:
+ externalService:
+   enabled: false
+   type: LoadBalancer
++  ## Local keeps the relay source address intact, so the kea reply rides the
++  ## tracked flow back out instead of being masqueraded onto a random port.
++  externalTrafficPolicy: Local
+   annotations: {}
