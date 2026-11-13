@@ -1,0 +1,16 @@
+#! Copy to values.local.yaml (gitignored), read by apply.sh for site values.
+#! Remote site prefixes are placeholders, set them per deployment. They must match
+#! DPF_REMOTE_PREFIXES and REMOTE_GW_LAN_ADDR in lab/dpf.env.
+dpf:
+  site_fabric_prefixes: ["10.42.91.0/24"]
+  networks:
+  #! Remote BMCs and DPU OOB, DHCP relayed by the remote GW whose LAN address is the gateway.
+  - name: remote_underlay
+    type: underlay
+    prefix: 10.42.90.0/24
+    gateway: 10.42.90.1
+  #! Host admin network, served through the DPUs.
+  - name: remote_admin
+    type: admin
+    prefix: 10.42.91.0/24
+    gateway: 10.42.91.1

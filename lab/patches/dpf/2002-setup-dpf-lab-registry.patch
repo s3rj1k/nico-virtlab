@@ -1,0 +1,53 @@
+Lab DPF secrets so self-built NICo DPUServices pull from our registry, and public
+nvcr.io pulls stay anonymous when NICO_DPF_NGC_API_KEY is set empty.
+
+diff --git a/helm-prereqs/setup.sh b/helm-prereqs/setup.sh
+index f78afa3c9..ca057648a 100755
+--- a/helm-prereqs/setup.sh
++++ b/helm-prereqs/setup.sh
+@@ -406,7 +406,8 @@ NICO_STORAGE_CLASS="${NICO_STORAGE_CLASS:-local-path-persistent}"
+ # versions). NICO_DPF_SRC points at a local checkout instead (airgapped or
+ # self-managed).
+ NICO_DPF_SRC="${NICO_DPF_SRC:-}"
+-NICO_DPF_NGC_API_KEY="${NICO_DPF_NGC_API_KEY:-${REGISTRY_PULL_SECRET:-}}"
++# An explicitly empty key stays empty, so public nvcr.io pulls stay anonymous.
++NICO_DPF_NGC_API_KEY="${NICO_DPF_NGC_API_KEY-${REGISTRY_PULL_SECRET:-}}"
+ NICO_DPF_NICO_NGC_API_KEY="${NICO_DPF_NICO_NGC_API_KEY:-${NICO_DPF_NGC_API_KEY}}"
+ # DPF operator image. Defaults to the public NGC image (anonymous pull). To use
+ # your own registry (mirror or self-built, e.g. matching NICO_IMAGE_REGISTRY),
+@@ -1432,6 +1433,35 @@ if "${INSTALL_DPF}"; then
+         echo "NICO_DPF_NGC_API_KEY / REGISTRY_PULL_SECRET not set — skipping DPF pull"
+         echo "and Argo CD repository secrets (air-gapped or pre-loaded registry)."
+     fi
++    # Self-built NICo DPUServices pull from NICO_DPF_LAB_REGISTRY with the
++    # REGISTRY_PULL_* creds, both the images (nico-pull-secret) and the OCI charts.
++    if [[ -n "${NICO_DPF_LAB_REGISTRY:-}" && -n "${REGISTRY_PULL_SECRET:-}" ]]; then
++        echo "Creating lab DPF pull and Argo CD repository secrets for ${NICO_DPF_LAB_REGISTRY}..."
++        _lab_srv="${NICO_DPF_LAB_REGISTRY%%/*}"
++        _lab_user="${REGISTRY_PULL_USERNAME:-\$oauthtoken}"
++        _lab_auth="$(printf '%s' "${_lab_user}:${REGISTRY_PULL_SECRET}" | base64 | tr -d '\n')"
++        kubectl create secret generic nico-pull-secret \
++            --namespace dpf-operator-system \
++            --type=kubernetes.io/dockerconfigjson \
++            --from-file=.dockerconfigjson=<(printf \
++                '{"auths":{"%s":{"username":"%s","password":"%s","auth":"%s"}}}' \
++                "${_lab_srv}" "${_lab_user}" "${REGISTRY_PULL_SECRET}" "${_lab_auth}") \
++            --dry-run=client -o yaml | kubectl apply -f -
++        kubectl label secret nico-pull-secret -n dpf-operator-system \
++            dpu.nvidia.com/image-pull-secret="" --overwrite
++        # Argo CD matches OCI repos without the oci:// scheme carbide-api sends.
++        kubectl create secret generic nico-lab-oci-helm \
++            --namespace dpf-operator-system \
++            --from-literal=name=nico-lab-oci \
++            --from-literal=url="${NICO_DPF_LAB_REGISTRY}/charts" \
++            --from-literal=type=helm \
++            --from-literal=enableOCI=true \
++            --from-literal=username="${_lab_user}" \
++            --from-file=password=<(printf '%s' "${REGISTRY_PULL_SECRET}") \
++            --dry-run=client -o yaml | kubectl apply -f -
++        kubectl label secret nico-lab-oci-helm -n dpf-operator-system \
++            argocd.argoproj.io/secret-type=repository --overwrite
++    fi
+     # hbn-user-password: random local FRR credential for the HBN DPUService;
+     # generate only when absent so re-runs don't rotate it.
+     if ! kubectl get secret hbn-user-password -n dpf-operator-system &>/dev/null; then

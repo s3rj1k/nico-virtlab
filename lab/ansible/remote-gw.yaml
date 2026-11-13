@@ -1,0 +1,243 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# dpf flavour remote site box, the WireGuard peer of the worker hub. Brings up wg0, the
+# address and DHCP relay on the OOB LAN, optional NAT, and a VXLAN over wg0 per DPU port.
+# dpf-net.yaml runs it first, run it alone to redo just the remote side.
+# What the box needs is in lab/hints.md, section Remote site box.
+#
+#   source lab/dpf.env
+#   ansible-playbook -i lab/ansible/inventory.yml lab/ansible/remote-gw.yaml
+
+- name: Check the per deployment values
+  hosts: localhost
+  gather_facts: false
+  vars_files: vars/dpf-net.yml
+  tasks:
+    - name: Assert the remote site is described
+      ansible.builtin.assert:
+        that:
+          - hostvars['remote_gw'].ansible_host | default('') | length > 0
+          - dpf_wg_endpoint | length > 0
+          - dpf_remote_prefixes | length > 0
+          - dpf_gw_lan_addr is search('/')
+          - dpf_gw_lan_iface | length > 0
+          - "'CHANGEME' not in ([hostvars['remote_gw'].ansible_host | default(''), dpf_wg_endpoint,
+            dpf_gw_lan_addr, dpf_gw_lan_iface, dpf_gw_nat_iface] + dpf_remote_prefixes + dpf_dpu_ports)"
+        fail_msg: >-
+          Set REMOTE_GW_IP, DPF_WG_ENDPOINT, DPF_REMOTE_PREFIXES, REMOTE_GW_LAN_ADDR (CIDR) and
+          REMOTE_GW_LAN_IF, and replace every CHANGEME in lab/dpf.env. They differ per deployment.
+
+- name: WireGuard keys on both ends
+  hosts: worker:remote_gw
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Install WireGuard tools
+      ansible.builtin.apt:
+        name: wireguard-tools
+        update_cache: true
+
+    # The key never leaves the host, wg0.conf loads it in PostUp.
+    - name: Generate the WireGuard key once
+      ansible.builtin.shell: umask 077 && wg genkey > /etc/wireguard/wg0.key
+      args:
+        creates: /etc/wireguard/wg0.key
+
+    - name: Derive the public key
+      ansible.builtin.shell: wg pubkey < /etc/wireguard/wg0.key
+      register: wg_pub
+      changed_when: false
+
+    - name: Share the public key with the other end
+      ansible.builtin.set_fact:
+        wg_pubkey: "{{ wg_pub.stdout }}"
+
+- name: Remote site gateway
+  hosts: remote_gw
+  become: true
+  gather_facts: true
+  vars_files: vars/dpf-net.yml
+  vars:
+    gw_lan_ip: "{{ dpf_gw_lan_addr | split('/') | first }}"
+    wg_endpoint: "{{ dpf_wg_endpoint if ':' in dpf_wg_endpoint else dpf_wg_endpoint ~ ':' ~ dpf_wg_port }}"
+
+  handlers:
+    - name: Restart wg0
+      ansible.builtin.systemd_service:
+        name: wg-quick@wg0
+        state: restarted
+
+    - name: Restart lab-dpf-gw
+      ansible.builtin.systemd_service:
+        name: lab-dpf-gw
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart lab-dhcp-relay
+      ansible.builtin.systemd_service:
+        name: lab-dhcp-relay
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Assert the GW is Debian or Ubuntu
+      ansible.builtin.assert:
+        that: ansible_facts.distribution in ["Debian", "Ubuntu"]
+        fail_msg: "dpf-net.yaml supports a Debian/Ubuntu remote GW only."
+
+    # dnsmasq-base is the binary without the system DNS service.
+    - name: Install the GW packages
+      ansible.builtin.apt:
+        name: [dnsmasq-base, iptables, iproute2]
+
+    - name: Persist IPv4 forwarding
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-lab-dpf-net.conf
+        mode: "0644"
+        content: |
+          net.ipv4.ip_forward = 1
+
+    - name: Apply IPv4 forwarding
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Write wg0.conf
+      ansible.builtin.copy:
+        dest: /etc/wireguard/wg0.conf
+        mode: "0600"
+        content: |
+          [Interface]
+          Address = {{ dpf_wg_gw_addr }}/24
+          MTU = {{ dpf_wg_mtu }}
+          PostUp = wg set %i private-key /etc/wireguard/wg0.key
+
+          [Peer]
+          PublicKey = {{ hostvars['worker'].wg_pubkey }}
+          Endpoint = {{ wg_endpoint }}
+          AllowedIPs = {{ dpf_wg_hub_addr }}/32, {{ dpf_provisioning_subnet }}
+          PersistentKeepalive = 25
+      notify: Restart wg0
+
+    - name: Enable and start wg0
+      ansible.builtin.systemd_service:
+        name: wg-quick@wg0
+        enabled: true
+        state: started
+
+    # LAN address, optional NAT and the DPU port bridges, reapplied together on boot.
+    - name: Install the GW network script
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/lab-dpf-gw
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Idempotent, rerun by a timer. Interfaces that do not exist yet, like a hotplugged
+          # NIC or a bridge created later, are skipped until a later run.
+          set -euo pipefail
+          has() { [ -e "/sys/class/net/$1" ]; }
+          if has {{ dpf_gw_lan_iface }}; then
+            ip addr replace {{ dpf_gw_lan_addr }} dev {{ dpf_gw_lan_iface }}
+            ip link set {{ dpf_gw_lan_iface }} up
+          fi
+          {% if dpf_gw_nat_iface %}
+          {% for p in dpf_remote_prefixes %}
+          iptables -t nat -C POSTROUTING -s {{ p }} -o {{ dpf_gw_nat_iface }} -j MASQUERADE 2>/dev/null \
+            || iptables -t nat -A POSTROUTING -s {{ p }} -o {{ dpf_gw_nat_iface }} -j MASQUERADE
+          {% endfor %}
+          {% endif %}
+          {% for p in dpf_dpu_ports %}
+          if has {{ p }}; then
+          ip link show vxdpu{{ loop.index0 }} >/dev/null 2>&1 || ip link add vxdpu{{ loop.index0 }} type vxlan \
+            id {{ dpf_vxlan_vni_base + loop.index0 }} local {{ dpf_wg_gw_addr }} remote {{ dpf_wg_hub_addr }} dstport 4789
+          # A port that already is a bridge takes the VXLAN as is, a plain NIC gets its own.
+          if [ -d /sys/class/net/{{ p }}/bridge ]; then
+            br={{ p }}
+          else
+            br=brdpu{{ loop.index0 }}
+            ip link show $br >/dev/null 2>&1 || ip link add $br type bridge
+            ip link set {{ p }} mtu {{ dpf_port_mtu }} master $br up
+            ip link set $br mtu {{ dpf_port_mtu }} up
+          fi
+          ip link set vxdpu{{ loop.index0 }} mtu {{ dpf_port_mtu }} master $br up
+          fi
+          {% endfor %}
+      notify: Restart lab-dpf-gw
+
+    - name: Install the GW network unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-dpf-gw.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Remote LAN address, NAT and DPU port bridges
+          After=wg-quick@wg0.service network-online.target
+          Wants=wg-quick@wg0.service network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/lab-dpf-gw
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart lab-dpf-gw
+
+    - name: Install the GW network timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-dpf-gw.timer
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Reapply the remote GW network every 30s
+
+          [Timer]
+          OnBootSec=30s
+          OnUnitActiveSec=30s
+          AccuracySec=5s
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable and start the GW network unit
+      ansible.builtin.systemd_service:
+        name: lab-dpf-gw
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Enable and start the GW network timer
+      ansible.builtin.systemd_service:
+        name: lab-dpf-gw.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # dnsmasq relays with its LAN address as giaddr, so Kea picks the underlay network.
+    - name: Install the DHCP relay unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-dhcp-relay.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=DHCPv4 relay from {{ dpf_gw_lan_iface }} to {{ dpf_dhcp_server }}
+          After=lab-dpf-gw.service
+          Wants=lab-dpf-gw.service
+
+          [Service]
+          ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/dev/null --port=0 \
+            --interface={{ dpf_gw_lan_iface }} --bind-dynamic --log-dhcp \
+            --dhcp-relay={{ gw_lan_ip }},{{ dpf_dhcp_server }}
+          Restart=on-failure
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart lab-dhcp-relay
+
+    - name: Enable and start the DHCP relay
+      ansible.builtin.systemd_service:
+        name: lab-dhcp-relay
+        enabled: true
+        state: started
+        daemon_reload: true

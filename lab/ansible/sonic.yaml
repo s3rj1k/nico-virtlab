@@ -1,0 +1,249 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# dpf flavour ToR. sonic-vs as a KVM guest on the worker, front panel port N on brdpuN
+# from dpf-net.yaml, so Ethernet0, Ethernet4 and on face the remote DPU ports. BGP
+# unnumbered on every port, remote-as external, IPv4 and EVPN. Run after dpf-net.yaml.
+#
+#   source lab/dpf.env
+#   ansible-playbook -i lab/ansible/inventory.yml lab/ansible/sonic.yaml
+
+- name: sonic-vs ToR on the lab worker
+  hosts: worker
+  become: true
+  gather_facts: false
+  vars_files: vars/dpf-net.yml
+
+  vars:
+    sonic_image_url: "{{ SONIC_IMAGE_URL | default(lookup('env', 'SONIC_IMAGE_URL')) | default('https://sonic-build.azurewebsites.net/api/sonic/artifacts?branchName=master&platform=vs&target=target/sonic-vs.img.gz', true) }}"
+    sonic_image: /var/lib/libvirt/images/sonic-vs.img
+    sonic_disk: /var/lib/libvirt/images/sonic-tor.qcow2
+    sonic_vcpus: "{{ SONIC_VCPUS | default(4) }}"
+    sonic_memory_mb: "{{ SONIC_MEMORY_MB | default(4096) }}"
+    # Own NAT network for the SONiC mgmt port, the default one is the provisioning macvtap.
+    sonic_mgmt_net: sonic-mgmt
+    sonic_mgmt_mac: "52:54:00:5c:00:01"
+    sonic_mgmt_ip: 192.168.123.10
+    # Image default login, the guest is reachable from the worker only.
+    sonic_user: admin
+    sonic_password: "{{ SONIC_PASSWORD | default('YourPaSsWoRd') }}"
+    # Lab choices, the DPUs peer with remote-as external so any private ASN works.
+    sonic_asn: "{{ SONIC_ASN | default(lookup('env', 'SONIC_ASN')) | default(65100, true) }}"
+    sonic_router_id: "{{ SONIC_ROUTER_ID | default(lookup('env', 'SONIC_ROUTER_ID')) | default('10.42.73.1', true) }}"
+    sonic_ports: "{{ range(0, (dpf_dpu_ports | length) * 4, 4) | map('string') | map('regex_replace', '^', 'Ethernet') | list }}"
+    sonic_recreate: "{{ SONIC_RECREATE | default(false) | bool }}"
+
+  tasks:
+    - name: Assert DPU ports are set
+      ansible.builtin.assert:
+        that: dpf_dpu_ports | length > 0 and 'CHANGEME' not in dpf_dpu_ports
+        fail_msg: "Set DPF_DPU_PORTS (see lab/dpf.env.example) and run dpf-net.yaml first."
+
+    - name: Install the sonic-vs helpers
+      ansible.builtin.apt:
+        name: [sshpass, qemu-utils]
+
+    - name: Assert the DPU port bridges exist
+      ansible.builtin.command: "ip link show brdpu{{ item }}"
+      loop: "{{ range(dpf_dpu_ports | length) | list }}"
+      changed_when: false
+
+    - name: Download the sonic-vs image
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -fsSL --retry 5 '{{ sonic_image_url }}' | gunzip > {{ sonic_image }}.part
+        mv {{ sonic_image }}.part {{ sonic_image }}
+      args:
+        executable: /bin/bash
+        creates: "{{ sonic_image }}"
+
+    - name: Define the sonic-mgmt network
+      ansible.builtin.copy:
+        dest: /etc/libvirt/sonic-mgmt.xml
+        mode: "0644"
+        content: |
+          <network>
+            <name>{{ sonic_mgmt_net }}</name>
+            <forward mode='nat'/>
+            <bridge name='virbr-sonic' stp='on' delay='0'/>
+            <ip address='192.168.123.1' netmask='255.255.255.0'>
+              <dhcp>
+                <range start='192.168.123.100' end='192.168.123.200'/>
+                <host mac='{{ sonic_mgmt_mac }}' ip='{{ sonic_mgmt_ip }}'/>
+              </dhcp>
+            </ip>
+          </network>
+      register: sonic_net_xml
+
+    - name: Load the sonic-mgmt network
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if virsh net-info {{ sonic_mgmt_net }} >/dev/null 2>&1; then
+          {% if sonic_net_xml.changed %}
+          virsh net-destroy {{ sonic_mgmt_net }} || true
+          virsh net-undefine {{ sonic_mgmt_net }}
+          {% else %}
+          exit 0
+          {% endif %}
+        fi
+        virsh net-define /etc/libvirt/sonic-mgmt.xml
+        virsh net-autostart {{ sonic_mgmt_net }}
+        virsh net-start {{ sonic_mgmt_net }}
+      args:
+        executable: /bin/bash
+      register: sonic_net_load
+      changed_when: "'defined' in sonic_net_load.stdout"
+
+    - name: Drop the existing sonic-tor domain
+      ansible.builtin.shell: |
+        virsh destroy sonic-tor || true
+        virsh undefine sonic-tor || true
+        rm -f {{ sonic_disk }}
+      when: sonic_recreate
+
+    - name: Create the sonic-tor disk from the image
+      ansible.builtin.shell: |
+        set -euo pipefail
+        fmt="$(qemu-img info {{ sonic_image }} | awk '/^file format/ {print $3}')"
+        qemu-img create -f qcow2 -F "$fmt" -b {{ sonic_image }} {{ sonic_disk }}
+      args:
+        executable: /bin/bash
+        creates: "{{ sonic_disk }}"
+
+    # e1000 everywhere like the sonic-mgmt KVM testbed, NIC 1 is eth0 and NIC N+2 Ethernet(4N).
+    - name: Write the sonic-tor domain
+      ansible.builtin.copy:
+        dest: /etc/libvirt/sonic-tor.xml
+        mode: "0644"
+        content: |
+          <domain type='kvm'>
+            <name>sonic-tor</name>
+            <memory unit='MiB'>{{ sonic_memory_mb }}</memory>
+            <vcpu>{{ sonic_vcpus }}</vcpu>
+            <os><type arch='x86_64' machine='pc'>hvm</type><boot dev='hd'/></os>
+            <cpu mode='host-passthrough'/>
+            <features><acpi/><apic/></features>
+            <on_reboot>restart</on_reboot>
+            <devices>
+              <disk type='file' device='disk'>
+                <driver name='qemu' type='qcow2' cache='writeback'/>
+                <source file='{{ sonic_disk }}'/>
+                <target dev='vda' bus='virtio'/>
+              </disk>
+              <interface type='network'>
+                <source network='{{ sonic_mgmt_net }}'/>
+                <mac address='{{ sonic_mgmt_mac }}'/>
+                <model type='e1000'/>
+              </interface>
+          {% for p in dpf_dpu_ports %}
+              <interface type='bridge'>
+                <source bridge='brdpu{{ loop.index0 }}'/>
+                <model type='e1000'/>
+                <mtu size='{{ dpf_port_mtu }}'/>
+              </interface>
+          {% endfor %}
+              <serial type='pty'><target port='0'/></serial>
+              <console type='pty'><target type='serial' port='0'/></console>
+            </devices>
+          </domain>
+      register: sonic_dom_xml
+
+    - name: Define and start sonic-tor
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # A domain without a UUID cannot be redefined, SONIC_RECREATE=true applies XML changes.
+        if ! virsh dominfo sonic-tor >/dev/null 2>&1; then
+          virsh define /etc/libvirt/sonic-tor.xml >/dev/null
+          virsh autostart sonic-tor >/dev/null
+        fi
+        virsh domstate sonic-tor | grep -q running && echo running || { virsh start sonic-tor; echo started; }
+      args:
+        executable: /bin/bash
+      register: sonic_start
+      changed_when: "'started' in sonic_start.stdout"
+
+    - name: Wait for SONiC SSH
+      ansible.builtin.wait_for:
+        host: "{{ sonic_mgmt_ip }}"
+        port: 22
+        timeout: 1200
+
+    - name: Write the SONiC lab config
+      ansible.builtin.copy:
+        dest: /etc/libvirt/sonic-tor.json
+        mode: "0644"
+        content: |
+          {
+            "DEVICE_METADATA": {"localhost": {"hostname": "sonic-tor", "bgp_asn": "{{ sonic_asn }}",
+              "docker_routing_config_mode": "split"}},
+            "LOOPBACK_INTERFACE": {"Loopback0": {}, "Loopback0|{{ sonic_router_id }}/32": {}},
+            "PORT": {
+          {% for p in sonic_ports %}
+              "{{ p }}": {"admin_status": "up", "mtu": "{{ dpf_port_mtu }}"}{{ "," if not loop.last }}
+          {% endfor %}
+            },
+            "INTERFACE": {
+          {% for p in sonic_ports %}
+              "{{ p }}": {"ipv6_use_link_local_only": "enable"}{{ "," if not loop.last }}
+          {% endfor %}
+            }
+          }
+
+    - name: Write the SONiC BGP config
+      ansible.builtin.copy:
+        dest: /etc/libvirt/sonic-tor-bgpd.conf
+        mode: "0644"
+        content: |
+          router bgp {{ sonic_asn }}
+           bgp router-id {{ sonic_router_id }}
+           no bgp ebgp-requires-policy
+           bgp bestpath as-path multipath-relax
+           neighbor DPU peer-group
+           neighbor DPU remote-as external
+          {% for p in sonic_ports %}
+           neighbor {{ p }} interface peer-group DPU
+          {% endfor %}
+           address-family ipv4 unicast
+            redistribute connected
+            neighbor DPU activate
+           exit-address-family
+           address-family l2vpn evpn
+            neighbor DPU activate
+            advertise-all-vni
+           exit-address-family
+
+    # The stock image is a T1 with /31 peers on every port, drop those first. In split
+    # mode FRR boots from /etc/sonic/frr/bgpd.conf, so ours replaces that file whole.
+    - name: Apply the SONiC config
+      ansible.builtin.shell: |
+        set -euo pipefail
+        o="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+        export SSHPASS='{{ sonic_password }}'
+        sshpass -e scp $o /etc/libvirt/sonic-tor.json /etc/libvirt/sonic-tor-bgpd.conf {{ sonic_user }}@{{ sonic_mgmt_ip }}:/tmp/
+        sshpass -e ssh $o {{ sonic_user }}@{{ sonic_mgmt_ip }} '
+          set -e
+          db="sudo sonic-db-cli CONFIG_DB"
+          for k in $($db keys "BGP_NEIGHBOR|*") $($db keys "INTERFACE|*") $($db keys "LOOPBACK_INTERFACE|*"); do
+            $db del "$k" >/dev/null
+          done
+          sudo sonic-cfggen -j /tmp/sonic-tor.json --write-to-db
+          sudo config save -y
+          sudo install -m 0644 /tmp/sonic-tor-bgpd.conf /etc/sonic/frr/bgpd.conf
+          sudo systemctl reset-failed bgp || true
+          sudo systemctl restart bgp
+          for i in $(seq 60); do sudo vtysh -c "show bgp summary" >/dev/null 2>&1 && break; sleep 5; done'
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Show the BGP summary
+      ansible.builtin.shell: |
+        SSHPASS='{{ sonic_password }}' sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o LogLevel=ERROR {{ sonic_user }}@{{ sonic_mgmt_ip }} 'show ip bgp summary' || true
+      register: sonic_bgp
+      changed_when: false
+
+    - name: BGP summary
+      ansible.builtin.debug:
+        var: sonic_bgp.stdout_lines

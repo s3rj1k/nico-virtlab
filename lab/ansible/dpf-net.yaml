@@ -1,0 +1,170 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# dpf flavour lab side. Runs remote-gw.yaml, then the WireGuard hub on the worker with a
+# bridge per DPU port for sonic-vs (sonic.yaml), and mgmt routes to the remote prefixes.
+#
+#   source lab/dpf.env   # per deployment values, see lab/dpf.env.example
+#   ansible-playbook -i lab/ansible/inventory.yml lab/ansible/dpf-net.yaml
+
+- name: Remote site box
+  ansible.builtin.import_playbook: remote-gw.yaml
+
+- name: WireGuard hub and DPU port bridges on the worker
+  hosts: worker
+  become: true
+  gather_facts: false
+  vars_files: vars/dpf-net.yml
+
+  handlers:
+    - name: Restart wg0
+      ansible.builtin.systemd_service:
+        name: wg-quick@wg0
+        state: restarted
+
+    - name: Restart lab-dpf-ports
+      ansible.builtin.systemd_service:
+        name: lab-dpf-ports
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Persist IPv4 forwarding
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-lab-dpf-net.conf
+        mode: "0644"
+        content: |
+          net.ipv4.ip_forward = 1
+
+    - name: Apply IPv4 forwarding
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    # Remote prefixes route into the tunnel, mgmt sends them here (dpf-net mgmt play).
+    - name: Write wg0.conf
+      ansible.builtin.copy:
+        dest: /etc/wireguard/wg0.conf
+        mode: "0600"
+        content: |
+          [Interface]
+          Address = {{ dpf_wg_hub_addr }}/24
+          ListenPort = {{ dpf_wg_port }}
+          MTU = {{ dpf_wg_mtu }}
+          PostUp = wg set %i private-key /etc/wireguard/wg0.key
+          PostUp = iptables -I FORWARD -i %i -j ACCEPT; iptables -I FORWARD -o %i -j ACCEPT
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
+
+          [Peer]
+          PublicKey = {{ hostvars['remote_gw'].wg_pubkey }}
+          AllowedIPs = {{ ([dpf_wg_gw_addr ~ '/32'] + dpf_remote_prefixes) | join(', ') }}
+      notify: Restart wg0
+
+    - name: Enable and start wg0
+      ansible.builtin.systemd_service:
+        name: wg-quick@wg0
+        enabled: true
+        state: started
+
+    - name: DPU port bridges
+      when: dpf_dpu_ports | length > 0
+      block:
+        - name: Install the DPU port script
+          ansible.builtin.copy:
+            dest: /usr/local/sbin/lab-dpf-ports
+            mode: "0755"
+            content: |
+              #!/bin/bash
+              # Idempotent. brdpuN ends the VXLAN from the GW port cabled to DPU port N.
+              set -euo pipefail
+              {% for p in dpf_dpu_ports %}
+              ip link show vxdpu{{ loop.index0 }} >/dev/null 2>&1 || ip link add vxdpu{{ loop.index0 }} type vxlan \
+                id {{ dpf_vxlan_vni_base + loop.index0 }} local {{ dpf_wg_hub_addr }} remote {{ dpf_wg_gw_addr }} dstport 4789
+              ip link show brdpu{{ loop.index0 }} >/dev/null 2>&1 || ip link add brdpu{{ loop.index0 }} type bridge
+              ip link set vxdpu{{ loop.index0 }} mtu {{ dpf_port_mtu }} master brdpu{{ loop.index0 }} up
+              ip link set brdpu{{ loop.index0 }} mtu {{ dpf_port_mtu }} up
+              {% endfor %}
+          notify: Restart lab-dpf-ports
+
+        - name: Install the DPU port unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/lab-dpf-ports.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=VXLAN bridges for the remote DPU ports
+              After=wg-quick@wg0.service
+              Wants=wg-quick@wg0.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=true
+              ExecStart=/usr/local/sbin/lab-dpf-ports
+
+              [Install]
+              WantedBy=multi-user.target
+          notify: Restart lab-dpf-ports
+
+        - name: Enable and start the DPU port unit
+          ansible.builtin.systemd_service:
+            name: lab-dpf-ports
+            enabled: true
+            state: started
+            daemon_reload: true
+
+- name: Routes from mgmt to the remote site
+  hosts: mgmt
+  become: true
+  gather_facts: false
+  vars_files: vars/dpf-net.yml
+  vars:
+    # mgmt.yaml policy table for DHCP replies, they must follow the same routes.
+    dhcp_reply_table: 100
+
+  handlers:
+    - name: Restart lab-dpf-routes
+      ansible.builtin.systemd_service:
+        name: lab-dpf-routes
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Install the remote route script
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/lab-dpf-routes
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Idempotent. Remote prefixes sit behind the worker, also for relayed DHCP replies.
+          set -euo pipefail
+          {% for p in dpf_remote_prefixes + [dpf_wg_subnet] %}
+          ip route replace {{ p }} via {{ dpf_worker_provisioning_ip }} dev {{ dpf_provisioning_iface }}
+          ip route replace {{ p }} via {{ dpf_worker_provisioning_ip }} dev {{ dpf_provisioning_iface }} table {{ dhcp_reply_table }}
+          {% endfor %}
+      notify: Restart lab-dpf-routes
+
+    - name: Install the remote route unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/lab-dpf-routes.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Routes to the remote DPF site via the worker
+          After=network-online.target lab-dhcp-reply-route.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=true
+          ExecStart=/usr/local/sbin/lab-dpf-routes
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart lab-dpf-routes
+
+    - name: Enable and start the remote route unit
+      ansible.builtin.systemd_service:
+        name: lab-dpf-routes
+        enabled: true
+        state: started
+        daemon_reload: true

@@ -21,3 +21,7 @@ all:
       ansible_host: "{{ lookup('env', 'MGMT_IP') | default('10.42.71.102', true) }}"
     worker:
       ansible_host: "{{ lookup('env', 'WORKER_IP') | default('10.42.71.103', true) }}"
+    # dpf flavour only, the remote site box. Not part of the heat stack, set per deployment.
+    remote_gw:
+      ansible_host: "{{ lookup('env', 'REMOTE_GW_IP') }}"
+      ansible_user: "{{ lookup('env', 'REMOTE_GW_USER') | default(lookup('env', 'USER'), true) }}"

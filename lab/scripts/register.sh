@@ -65,10 +65,11 @@ done
 for w in "${WORKLOADS[@]}"; do kubectl -n "$NS" rollout restart "$w" >/dev/null; done
 for w in "${WORKLOADS[@]}"; do kubectl -n "$NS" rollout status "$w" --timeout=180s; done
 
-# Completed job pods never reach Ready, so only wait on the running ones.
+# Completed job pods and pods of the replaced ReplicaSet never reach Ready, so skip them.
 echo "[1/8] waiting for ${NS} pods to be Ready..."
-kubectl -n "$NS" wait --for=condition=Ready pod --all \
-  --field-selector=status.phase=Running --timeout=300s >/dev/null
+mapfile -t PODS < <(kubectl -n "$NS" get pods --field-selector=status.phase=Running -o json |
+  jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "pod/" + .metadata.name')
+kubectl -n "$NS" wait --for=condition=Ready "${PODS[@]}" --timeout=300s >/dev/null
 
 # rollout status returns before the LoadBalancer endpoints repopulate, and a host
 # that PXE boots in that gap gets no answer and falls through to disk.
@@ -215,7 +216,9 @@ if [[ "$BMC_PORT" != "443" ]]; then
   echo "[5/8] bmc_proxy = PortOnly($BMC_PORT) (cluster-wide)..."
   admin set bmc-proxy --enabled true --proxy ":${BMC_PORT}" >/dev/null
 else
-  echo "[5/8] bmc_proxy left as-is (BMC_PORT=443)"
+  # Nothing to clear. Without bmc_proxy in the config nico-api refuses runtime changes,
+  # and the step 1 rollout dropped any older override.
+  echo "[5/8] bmc_proxy unset (BMC_PORT=443)"
 fi
 
 echo "[6/8] enabling create-machines..."

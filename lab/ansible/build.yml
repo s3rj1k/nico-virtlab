@@ -450,6 +450,9 @@
               environment:
                 # Overlays that name lab images read it, so they match what is built.
                 NICO_IMAGE_REGISTRY: "{{ image_repo }}"
+                # Only base is built. Later groups are deploy time only, so they never
+                # change the stamped VERSION or force a rebuild.
+                NICO_LAB_GROUPS: base
               changed_when: true
 
             # Lands on a detached HEAD one commit above the pin, which is exactly what

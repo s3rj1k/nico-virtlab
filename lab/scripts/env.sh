@@ -25,13 +25,16 @@ CORE_TAG="${CORE_TAG:-virtlab}"
 # REST images share the Core build tag (one IMAGE_TAG for the whole build).
 NICO_REST_IMAGE_TAG="${NICO_REST_IMAGE_TAG:-$CORE_TAG}"
 
+# Deploy flavour on top of base, sushy (emulated hosts) or dpf (real DPU hosts).
+NICO_LAB_FLAVOR="${NICO_LAB_FLAVOR:-sushy}"
+
 HOST_IP="${HOST_IP:-192.168.42.221}"
 BMH_NAME="${BMH_NAME:-node1}"
 BOOT_MAC="${BOOT_MAC:-52:54:00:12:34:01}"
 
 BMC_MAC="${BMC_MAC:-02:00:00:00:00:01}"
 BMC_IP="${BMC_IP:-10.42.71.103}"
-BMC_PORT="${BMC_PORT:-8000}"
+BMC_PORT="${BMC_PORT:-443}"
 # Redfish System name that sushy maps to the domain UUID
 BMC_REDFISH_ID="${BMC_REDFISH_ID:-node1}"
 BMC_USERNAME="${BMC_USERNAME:-admin}"
@@ -62,6 +65,7 @@ umask 077
   printf 'export NICO_IMAGE_REGISTRY=%q\n'  "${REGISTRY}/${IMAGE_NAMESPACE}"
   printf 'export NICO_CORE_IMAGE_TAG=%q\n'  "$CORE_TAG"
   printf 'export NICO_REST_IMAGE_TAG=%q\n'  "$NICO_REST_IMAGE_TAG"
+  printf 'export NICO_LAB_FLAVOR=%q\n'      "$NICO_LAB_FLAVOR"
   printf 'HOST_IP=%q\n'                     "$HOST_IP"
   printf 'BMH_NAME=%q\n'                    "$BMH_NAME"
   printf 'BOOT_MAC=%q\n'                    "$BOOT_MAC"

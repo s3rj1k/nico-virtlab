@@ -3,3 +3,36 @@
 #! Values the ytt overlays here can read. apply.sh sets image_registry from
 #! NICO_IMAGE_REGISTRY (registry host plus namespace, as lab.env exports it).
 image_registry: oci.s3rj1k.fyi/nv
+#! sushy flavour, the emulated zero-DPU hosts on a flat VPC.
+sushy:
+  vpc_name: devenv_flat_vpc
+  organization_id: devenv_test_org
+  network_name: devenv_host_inband
+  prefix: 192.168.42.0/24
+  gateway: 192.168.42.1
+  #! Host NICs live in .221 and up, HOST_IP in lab/scripts/env.sh.
+  reserve_first: 220
+#! dpf flavour, real hosts with DPUs. Site values go in values.local.yaml.
+dpf:
+  #! DHCP VIPs announced to DPUs, the nico-dhcp external VIP from base 0011.
+  #@schema/default ["192.168.42.201"]
+  dhcp_servers: [""]
+  #! 0 skips the p0/p1 ToR BGP checks, raise it once sonic-vs peers with the DPUs.
+  min_dpu_functioning_links: 0
+  route_servers: [""]
+  #! Appended to the base site_fabric_prefixes.
+  site_fabric_prefixes: [""]
+  #! Extra [networks.*] for DPU hosts. At least one underlay (remote BMCs and DPU OOB)
+  #! is required, its prefixes are per deployment.
+  networks:
+  - name: ""
+    type: ""
+    prefix: ""
+    gateway: ""
+    mtu: 1500
+    reserve_first: 5
+  #! Manually built bluefield DPUServices. Empty registry means image_registry.
+  services:
+    registry: ""
+    chart_version: "0.1.0"
+    tag: virtlab

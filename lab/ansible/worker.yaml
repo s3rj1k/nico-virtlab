@@ -22,7 +22,8 @@
     # Vanilla sushy-tools from master. PyPI 2.2.0 predates SUSHY_EMULATOR_VENDOR,
     # which is what lets libredfish pick its native Sushy vendor
     sushy_tools_pip: "{{ SUSHY_TOOLS_PIP | default('git+https://github.com/openstack/sushy-tools.git@master') }}"
-    redfish_port: 8000
+    # 443 like a real BMC, so emulated and real BMCs share a site without bmc_proxy.
+    redfish_port: "{{ REDFISH_PORT | default(443) }}"
     # Vendor string sushy puts in its ServiceRoot. libredfish maps it onto its
     # own native Sushy vendor, replacing the old scripted vendor entirely
     redfish_vendor: "{{ REDFISH_VENDOR | default('Sushy') }}"

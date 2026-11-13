@@ -1,0 +1,56 @@
+#! target: helm-prereqs/values/nico-core.yaml
+#! DPF site config for real hosts with DPUs.
+#@ load("@ytt:overlay", "overlay")
+#@ load("@ytt:data", "data")
+#@ load("@ytt:assert", "assert")
+#@ load("toml.star", "append", "get_list", "insert_after", "network", "quoted", "set_key")
+
+#@ d = data.values.dpf
+
+#! docker_repo_url is the chart image.repository as is, so it carries the image name.
+#@ def service(name, chart, image, reg):
+#@   return [
+#@     "",
+#@     "[dpf.services." + name + "]",
+#@     'helm_repo_url = "oci://' + reg + '/charts"',
+#@     'helm_chart = "' + chart + '"',
+#@     'helm_version = "' + d.services.chart_version + '"',
+#@     'docker_repo_url = "' + reg + "/" + image + '"',
+#@     'docker_image_tag = "' + d.services.tag + '"',
+#@   ]
+#@ end
+
+#@ def dpf_site(s):
+#@   if not d.services.tag:
+#@     assert.fail("dpf.services.tag is empty, set it in lab/patches/values.local.yaml")
+#@   end
+#@   if not [n for n in d.networks if n.type == "underlay"]:
+#@     assert.fail("dpf.networks has no underlay network for the remote BMCs, set it per deployment in lab/patches/values.local.yaml")
+#@   end
+#@   reg = d.services.registry or data.values.image_registry
+#@   s = set_key(s, "dhcp_servers", "[" + quoted(d.dhcp_servers) + "]")
+#@   s = insert_after(s, "dhcp_servers", ["min_dpu_functioning_links = " + str(d.min_dpu_functioning_links)])
+#@   s = set_key(s, "route_servers", "[" + quoted(d.route_servers) + "]")
+#@   s = set_key(s, "enable_route_servers", "true" if d.route_servers else "false")
+#@   fabric = get_list(s, "site_fabric_prefixes")
+#@   s = set_key(s, "site_fabric_prefixes", "[" + quoted(fabric + [p for p in d.site_fabric_prefixes if p not in fabric]) + "]")
+#@   extra = []
+#@   for n in d.networks:
+#@     extra.extend(network(n.name, n.type, n.prefix, n.gateway, n.mtu, n.reserve_first))
+#@   end
+#@   extra.extend(service("dpu_agent", "nico-dpu-agent", "forge-dpu-agent", reg))
+#@   extra.extend(service("dhcp_server", "nico-dhcp-server", "forge-dhcp-server", reg))
+#@   extra.extend(service("fmds", "nico-fmds", "carbide-fmds", reg))
+#@   extra.extend(service("otel", "nico-otelcol", "otelcol-contrib", reg))
+#@   # The chart default sidecar image sits in a private nvcr repo, it shares the otelcol tag.
+#@   extra.extend(["", "[dpf.services.otel.extra_helm_values.transceiverExporter.image]",
+#@     'repository = "' + reg + '/transceiver-exporter"'])
+#@   return append(s, extra)
+#@ end
+
+#@overlay/match by=overlay.all
+---
+nico-api:
+  siteConfig:
+    #@overlay/replace via=lambda old, _: dpf_site(old)
+    nicoApiSiteConfig: ""

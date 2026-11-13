@@ -1,0 +1,38 @@
+---
+# Copyright 2026 s3rj1k
+# SPDX-License-Identifier: MIT
+
+# Shared by dpf-net.yaml and sonic.yaml. Each value is read from -e NAME, then the
+# environment (source lab/dpf.env), then the default.
+
+# From the heat stack defaults.
+dpf_worker_ip: "{{ WORKER_IP | default(lookup('env', 'WORKER_IP')) | default('10.42.71.103', true) }}"
+dpf_worker_provisioning_ip: "{{ WORKER_SECONDARY_IP | default(lookup('env', 'WORKER_SECONDARY_IP')) | default('192.168.42.103', true) }}"
+dpf_provisioning_subnet: "{{ PROVISIONING_SUBNET | default(lookup('env', 'PROVISIONING_SUBNET')) | default('192.168.42.0/24', true) }}"
+dpf_provisioning_iface: "{{ PROVISIONING_NIC | default(lookup('env', 'PROVISIONING_NIC')) | default('ens4', true) }}"
+# nico-dhcp external VIP, base patch 0011.
+dpf_dhcp_server: "{{ DHCP_SERVER | default(lookup('env', 'DHCP_SERVER')) | default('192.168.42.201', true) }}"
+
+# Lab choices next to the heat primary network, override if they clash.
+dpf_wg_port: "{{ DPF_WG_PORT | default(lookup('env', 'DPF_WG_PORT')) | default(51820, true) | int }}"
+# Routed from mgmt as well, the GW itself talks to NICo from its tunnel address.
+dpf_wg_subnet: "{{ DPF_WG_SUBNET | default(lookup('env', 'DPF_WG_SUBNET')) | default('10.42.72.0/24', true) }}"
+dpf_wg_hub_addr: "{{ DPF_WG_HUB_ADDR | default(lookup('env', 'DPF_WG_HUB_ADDR')) | default('10.42.72.1', true) }}"
+dpf_wg_gw_addr: "{{ DPF_WG_GW_ADDR | default(lookup('env', 'DPF_WG_GW_ADDR')) | default('10.42.72.2', true) }}"
+dpf_wg_mtu: 1420
+# VXLAN over wg0 per DPU port, so the bridged ports carry 50 bytes less.
+dpf_vxlan_vni_base: 4200
+dpf_port_mtu: "{{ dpf_wg_mtu | int - 50 }}"
+
+# Per deployment, no usable default.
+# Worker floating IP from the heat output, the remote GW dials it.
+dpf_wg_endpoint: "{{ DPF_WG_ENDPOINT | default(lookup('env', 'DPF_WG_ENDPOINT')) }}"
+# Remote prefixes behind the GW, the underlay and admin networks of values.local.yaml.
+dpf_remote_prefixes: "{{ (DPF_REMOTE_PREFIXES | default(lookup('env', 'DPF_REMOTE_PREFIXES'))) | split(',') | map('trim') | select | list }}"
+# GW address on the remote BMC LAN, CIDR form. It is the underlay gateway and the relay giaddr.
+dpf_gw_lan_addr: "{{ REMOTE_GW_LAN_ADDR | default(lookup('env', 'REMOTE_GW_LAN_ADDR')) }}"
+dpf_gw_lan_iface: "{{ REMOTE_GW_LAN_IF | default(lookup('env', 'REMOTE_GW_LAN_IF')) }}"
+# GW NICs cabled to the DPU ports in order, they become sonic-vs Ethernet0, Ethernet4 and on.
+dpf_dpu_ports: "{{ (DPF_DPU_PORTS | default(lookup('env', 'DPF_DPU_PORTS'))) | split(',') | map('trim') | select | list }}"
+# Optional GW uplink to masquerade the remote prefixes out of, empty leaves egress alone.
+dpf_gw_nat_iface: "{{ REMOTE_GW_NAT_IF | default(lookup('env', 'REMOTE_GW_NAT_IF')) }}"

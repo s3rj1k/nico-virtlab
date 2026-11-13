@@ -1,0 +1,23 @@
+#! target: helm-prereqs/values/nico-core.yaml
+#! Flat VPC and HostInband segment for the emulated zero-DPU hosts.
+#@ load("@ytt:overlay", "overlay")
+#@ load("@ytt:data", "data")
+#@ load("toml.star", "append", "network")
+
+#@ s = data.values.sushy
+
+#@ def sushy_site(toml):
+#@   return append(toml, [
+#@     "",
+#@     "[vpcs." + s.vpc_name + "]",
+#@     'organization_id = "' + s.organization_id + '"',
+#@     'network_virtualization_type = "flat"',
+#@   ] + network(s.network_name, "hostinband", s.prefix, s.gateway, 1500, s.reserve_first, s.vpc_name))
+#@ end
+
+#@overlay/match by=overlay.all
+---
+nico-api:
+  siteConfig:
+    #@overlay/replace via=lambda old, _: sushy_site(old)
+    nicoApiSiteConfig: ""

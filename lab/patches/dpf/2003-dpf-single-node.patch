@@ -1,0 +1,64 @@
+Single node DPF control plane for the devenv, no HA.
+One kamaji controller, a single member kamaji-etcd, one replica of the DPF provisioning
+and kamaji cluster managers, and the DPU cluster TenantControlPlane patched down to one
+replica right after DPF creates it.
+
+diff --git a/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl b/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl
+index 185a2a7cf..74eb85367 100644
+--- a/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl
++++ b/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl
+@@ -29,6 +29,7 @@ spec:
+   dpuDetector:
+     disable: true
+   provisioningController:
++    replicas: 1
+     osInstallTimeout: "90m"
+     installInterface:
+       installViaRedfish:
+@@ -41,6 +42,7 @@ spec:
+     argoCDNamespace: dpf-operator-system
+   kamajiClusterManager:
+     disable: false
++    replicas: 1
+   networking:
+     highSpeedMTU: 9000
+   # No imagePullSecrets: the GA nvidia/doca operand images are public and pull
+diff --git a/helm-prereqs/operators/values/kamaji.yaml b/helm-prereqs/operators/values/kamaji.yaml
+index 7990c99bd..de98c6cce 100644
+--- a/helm-prereqs/operators/values/kamaji.yaml
++++ b/helm-prereqs/operators/values/kamaji.yaml
+@@ -14,7 +14,7 @@
+ # default 1) — a top-level `replicas:` is silently ignored, so HA needs this key.
+ # The controller runs --leader-elect, so 2 replicas give active/standby failover;
+ # there is no pod anti-affinity, so this never blocks scheduling on a small cluster.
+-replicaCount: 2
++replicaCount: 1
+ resources: null
+ affinity:
+   nodeAffinity:
+@@ -34,6 +34,8 @@ tolerations:
+     operator: Exists
+     effect: NoSchedule
+ kamaji-etcd:
++  # Single member etcd, the lab has one control plane node.
++  replicas: 1
+   persistentVolumeClaim:
+     storageClassName: local-path
+   affinity:
+diff --git a/helm-prereqs/setup.sh b/helm-prereqs/setup.sh
+index 917a2d32b..356168938 100755
+--- a/helm-prereqs/setup.sh
++++ b/helm-prereqs/setup.sh
+@@ -1529,6 +1529,12 @@ if "${INSTALL_DPF}"; then
+         < operators/dpf/dpfoperatorconfig.yaml.tmpl | kubectl apply -f -
+     envsubst '${NICO_DPF_DPU_INTERFACE} ${NICO_DPF_DPU_CLUSTER_VIP} ${NICO_DPF_CP_LABEL_VALUE}' \
+         < operators/dpf/dpucluster.yaml.tmpl | kubectl apply -f -
++    # DPF creates the TenantControlPlane with 3 replicas and never resets them, one is enough here.
++    for _ in $(seq 60); do
++        kubectl patch tenantcontrolplane carbide-dpf-cluster -n dpf-operator-system --type merge \
++            -p '{"spec":{"controlPlane":{"deployment":{"replicas":1}}}}' >/dev/null 2>&1 && break
++        sleep 5
++    done
+     if [[ -n "${NICO_DPF_METALLB_POOL:-}" ]]; then
+         export NICO_DPF_METALLB_POOL
+         envsubst '${NICO_DPF_METALLB_POOL} ${NICO_DPF_DPU_CLUSTER_VIP}' \

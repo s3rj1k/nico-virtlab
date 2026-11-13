@@ -1,8 +1,8 @@
 diff --git a/helm-prereqs/values/nico-core.yaml b/helm-prereqs/values/nico-core.yaml
-index 198302a34..1d3dd8cef 100644
+index 9711b405b..88f99990d 100644
 --- a/helm-prereqs/values/nico-core.yaml
 +++ b/helm-prereqs/values/nico-core.yaml
-@@ -37,10 +37,14 @@ nico-api:
+@@ -38,10 +38,14 @@ nico-api:
        # -----------------------------------------------------------------------
        # Site identity — REQUIRED: fill in your site's values.
        # -----------------------------------------------------------------------
@@ -21,7 +21,7 @@ index 198302a34..1d3dd8cef 100644
  
        # -----------------------------------------------------------------------
        # DHCP servers reachable from this site — REQUIRED: your nico-dhcp VIP(s).
-@@ -66,9 +70,9 @@ nico-api:
+@@ -67,9 +71,9 @@ nico-api:
        # these routes or require coverage.
        # deny_prefixes: prefixes instances must NOT reach (OOB, ctrl-plane, underlay).
        # -----------------------------------------------------------------------
@@ -33,14 +33,13 @@ index 198302a34..1d3dd8cef 100644
  
        # -----------------------------------------------------------------------
        # FNN related configuration
-@@ -82,8 +86,18 @@ nico-api:
+@@ -83,8 +87,17 @@ nico-api:
        # Site explorer — periodic background scan of site inventory
        # -----------------------------------------------------------------------
        [site_explorer]
 +      # Only libredfish carries the native Sushy vendor, nv-redfish has no notion
 +      # of the emulator, so the lab pins the backend rather than taking the default
 +      explore_mode = "libredfish"
-+      bmc_proxy = ":8000"            # sushy BMC port, matches BMC_PORT in env.sh
        run_interval = "30s"
  
 +      [auth]
@@ -52,7 +51,7 @@ index 198302a34..1d3dd8cef 100644
        # -----------------------------------------------------------------------
        # Machine + BOM validation
        # -----------------------------------------------------------------------
-@@ -104,15 +118,15 @@ nico-api:
+@@ -105,15 +118,15 @@ nico-api:
        [pools.lo-ip]
        type = "ipv4"
        # One address per machine, hosts and DPUs alike: size for hosts x (1 + DPUs per host).
@@ -71,7 +70,7 @@ index 198302a34..1d3dd8cef 100644
  
        [pools.vpc-vni]
        type = "integer"
-@@ -120,7 +134,7 @@ nico-api:
+@@ -121,7 +134,7 @@ nico-api:
        # must match the config on your FNN gateways and must NOT be expanded without coordinating
        # with your network team. The range must also NOT include the fixed admin_vpc vpc_vni
        # value set in [fnn.admin_vpc] below. Example for non-FNN: [{ start = "0", end = "100" }]
@@ -80,27 +79,7 @@ index 198302a34..1d3dd8cef 100644
  
        # -----------------------------------------------------------------------
        # Networks — named L3 segments visible to nico-api.
-@@ -140,6 +154,19 @@ nico-api:
-       #   mtu = 1500
-       #   reserve_first = 2
-       # -----------------------------------------------------------------------
-+      # Flat-VPC HostInband segment seeded by nico-api at startup, replacing the old
-+      # register.sh grpcurl calls. It also creates the static-assignments UNDERLAY anchor.
-+      [vpcs.devenv_flat_vpc]
-+      organization_id = "devenv_test_org"
-+      network_virtualization_type = "flat"
-+
-+      [networks.devenv_host_inband]
-+      type = "hostinband"
-+      prefix = "192.168.42.0/24"
-+      gateway = "192.168.42.1"
-+      mtu = 1500
-+      reserve_first = 220                # host nics live in .221+ (HOST_IP in lab/scripts/env.sh)
-+      vpc_name = "devenv_flat_vpc"
- 
-       # -----------------------------------------------------------------------
-       # InfiniBand (disabled unless your site has an IB fabric)
-@@ -170,7 +197,7 @@ nico-api:
+@@ -171,7 +184,7 @@ nico-api:
  
  
        [fnn.admin_vpc]

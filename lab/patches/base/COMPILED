@@ -1,0 +1,5 @@
+# Base patches compiled into the images, as sha256sum prints them. Any change here
+# means an image rebuild, check-compiled.sh fails until this list matches.
+c4526977cb699a9892a0112264b4321d0750b991e714e126ba2a14c6f02fe68c  base/0014-site-explorer-default-libredfish.patch
+d6904f6bb68e6c75b2d389f511f2f95ecef8ecea05b23cd9caabc23ea49d946b  base/0015-nico-ipxe-newrootfs.patch
+0ab7f8915cb62fd38340259930fc32096e19681b1c20eafb5f2edb04349099fd  base/0016-machine-controller-honor-disable-lockdown.patch

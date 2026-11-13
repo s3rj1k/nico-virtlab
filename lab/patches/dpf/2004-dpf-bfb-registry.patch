@@ -1,0 +1,62 @@
+Serve BFBs to remote DPU BMCs at a fixed address they can reach.
+Redfish installs default to the node InternalIP and a random NodePort. DPF uses a set
+loadBalancerAddress verbatim, so it carries NICO_DPF_K8S_API_VIP and the bfb-registry
+NodePort, pinned to NICO_DPF_BFB_REGISTRY_NODEPORT (30085) on every setup.sh run.
+
+diff --git a/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl b/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl
+index 74eb85367..c40bf494b 100644
+--- a/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl
++++ b/helm-prereqs/operators/dpf/dpfoperatorconfig.yaml.tmpl
+@@ -34,6 +34,8 @@ spec:
+     installInterface:
+       installViaRedfish:
+         skipDPUNodeDiscovery: true
++    registry:
++      loadBalancerAddress: "http://${NICO_DPF_K8S_API_VIP}:${NICO_DPF_BFB_REGISTRY_NODEPORT}"
+   overrides:
+     # Host-cluster API server VIP/port that DPUs must be able to reach.
+     kubernetesAPIServerVIP: "${NICO_DPF_K8S_API_VIP}"
+diff --git a/helm-prereqs/setup.sh b/helm-prereqs/setup.sh
+index 356168938..6ed90ea2b 100755
+--- a/helm-prereqs/setup.sh
++++ b/helm-prereqs/setup.sh
+@@ -1522,10 +1522,12 @@ if "${INSTALL_DPF}"; then
+         NICO_DPF_K8S_API_PORT="$(kubectl get endpoints kubernetes -n default \
+             -o jsonpath='{.subsets[0].ports[0].port}')"
+     fi
+-    export NICO_DPF_K8S_API_VIP NICO_DPF_K8S_API_PORT
++    # Pinned bfb-registry NodePort, remote DPU BMCs fetch BFBs from it.
++    NICO_DPF_BFB_REGISTRY_NODEPORT="${NICO_DPF_BFB_REGISTRY_NODEPORT:-30085}"
++    export NICO_DPF_K8S_API_VIP NICO_DPF_K8S_API_PORT NICO_DPF_BFB_REGISTRY_NODEPORT
+     export NICO_DPF_DPU_INTERFACE NICO_DPF_DPU_CLUSTER_VIP
+     export NICO_DPF_CP_LABEL_VALUE="${NICO_DPF_CP_LABEL_VALUE:-}"
+-    envsubst '${NICO_DPF_K8S_API_VIP} ${NICO_DPF_K8S_API_PORT}' \
++    envsubst '${NICO_DPF_K8S_API_VIP} ${NICO_DPF_K8S_API_PORT} ${NICO_DPF_BFB_REGISTRY_NODEPORT}' \
+         < operators/dpf/dpfoperatorconfig.yaml.tmpl | kubectl apply -f -
+     envsubst '${NICO_DPF_DPU_INTERFACE} ${NICO_DPF_DPU_CLUSTER_VIP} ${NICO_DPF_CP_LABEL_VALUE}' \
+         < operators/dpf/dpucluster.yaml.tmpl | kubectl apply -f -
+@@ -1558,6 +1560,24 @@ if "${INSTALL_DPF}"; then
+         sleep 10
+     done
+ 
++    # DPF leaves the NodePort random and recreates the Service after config changes, so
++    # repatch until it holds the pinned value for three checks in a row.
++    _held=0
++    for _ in $(seq 90); do
++        if [[ "$(kubectl get svc bfb-registry -n dpf-operator-system \
++                -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)" == "${NICO_DPF_BFB_REGISTRY_NODEPORT}" ]]; then
++            (( ++_held >= 3 )) && break
++        else
++            _held=0
++            kubectl patch svc bfb-registry -n dpf-operator-system --type json -p \
++                "[{\"op\":\"replace\",\"path\":\"/spec/ports/0/nodePort\",\"value\":${NICO_DPF_BFB_REGISTRY_NODEPORT}}]" \
++                >/dev/null 2>&1 || true
++        fi
++        sleep 5
++    done
++    echo "bfb-registry at http://${NICO_DPF_K8S_API_VIP}:$(kubectl get svc bfb-registry -n dpf-operator-system \
++        -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)"
++
+     # 5b.8 Core is deployed with [dpf] enabled after these prerequisites exist.
+     #      carbide-api can initialize DPF without the site-wide BMC root and its
+     #      refresh task writes bmc-shared-password after the credential appears.
