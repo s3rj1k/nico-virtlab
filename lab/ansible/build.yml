@@ -15,6 +15,7 @@
 #   ansible-playbook lab/ansible/build.yml -K -e nico_sync_submodule=false # keep HEAD
 #   ansible-playbook lab/ansible/build.yml -K --tags tools             # host setup only
 #   ansible-playbook lab/ansible/build.yml -K -e force_tools=true      # refetch CLIs
+#   REGISTRY=registry.example.com IMAGE_NAMESPACE=lab ansible-playbook lab/ansible/build.yml -K
 #
 # Tags are tools, clean and build. Needs Debian or Ubuntu amd64, passwordless
 # sudo, and a prior `docker login` as the invoking user (not root).
@@ -38,10 +39,12 @@
     min_free_disk_gb: 150
     # kubectl minor to match the mgmt k0s track in mgmt.yaml.
     builder_kubectl_channel: "1.35"
-    # Registry host used for the docker login check below.
-    image_registry: "oci.s3rj1k.fyi"
+    # Registry host used for the docker login check below. Override with REGISTRY
+    # in the environment, the same name env.sh reads.
+    image_registry: "{{ lookup('env', 'REGISTRY') | default('oci.s3rj1k.fyi', true) }}"
     # Subfolder the images publish under so they are not at the registry root.
-    image_namespace: "nv"
+    # Override with IMAGE_NAMESPACE in the environment.
+    image_namespace: "{{ lookup('env', 'IMAGE_NAMESPACE') | default('nv', true) }}"
     # Full repository prefix passed to make and used for the registry ref checks.
     image_repo: "{{ image_registry }}/{{ image_namespace }}"
     # One moving tag named after the branch, so nothing has to be recomputed and
@@ -444,6 +447,9 @@
               ansible.builtin.command: lab/patches/apply.sh
               args:
                 chdir: "{{ virtlab_root }}"
+              environment:
+                # Overlays that name lab images read it, so they match what is built.
+                NICO_IMAGE_REGISTRY: "{{ image_repo }}"
               changed_when: true
 
             # Lands on a detached HEAD one commit above the pin, which is exactly what

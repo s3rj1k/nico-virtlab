@@ -2,7 +2,7 @@
 # Runs nico-admin-cli inside the nico-api pod with the pod's SPIFFE identity over
 # mTLS on the lab k0s in nico-system. Pass any admin-cli args, for example
 #   lab/scripts/admin-cli.sh machine show
-#   lab/scripts/admin-cli.sh machine show -f json
+#   lab/scripts/admin-cli.sh -f json machine show
 # NICo's own infra-controller/dev/bin/admin-cli.sh targets the old minikube/
 # forge-system layout, not this k0s lab, so use this wrapper instead.
 set -euo pipefail

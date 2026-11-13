@@ -1,16 +1,19 @@
 #! target: helm-prereqs/values/nico-core.yaml
 #! Structural devsite values. TOML site config fixups live in 0012.
 #@ load("@ytt:overlay", "overlay")
+#@ load("@ytt:data", "data")
 
 #@overlay/match by=overlay.all
 ---
 global:
   image:
     pullPolicy: Always
-  #! Registry serves reads anonymously so no pull secret is needed. Empties the
-  #! imagepullsecret ref that setup.sh only fills when REGISTRY_PULL_SECRET is set.
+  #! setup.sh creates imagepullsecret in nico-system from REGISTRY_PULL_SECRET but
+  #! the core install never references it, so point every core workload at it.
+  #! Without REGISTRY_PULL_SECRET the secret is absent and kubelet pulls anonymously.
   #@overlay/replace
-  imagePullSecrets: []
+  imagePullSecrets:
+  - name: imagepullsecret
 
 nico-api:
   hostname: "carbide-api.192.168.42.211.sslip.io"
@@ -57,13 +60,13 @@ nico-pxe:
   #@overlay/replace
   bootArtifactContainers:
   - name: boot-artifacts-x86-64
-    repository: oci.s3rj1k.fyi/nv/boot-artifacts-x86_64
+    repository: #@ data.values.image_registry + "/boot-artifacts-x86_64"
     command: ["sh", "-c", "cp -r /x86_64 /forge-boot-artifacts/blobs/internal"]
   - name: boot-artifacts-aarch64
-    repository: oci.s3rj1k.fyi/nv/boot-artifacts-aarch64
+    repository: #@ data.values.image_registry + "/boot-artifacts-aarch64"
     command: ["sh", "-c", "cp -r /aarch64 /apt /forge-boot-artifacts/blobs/internal"]
   - name: machine-validation-config
-    repository: oci.s3rj1k.fyi/nv/machine-validation
+    repository: #@ data.values.image_registry + "/machine-validation"
     command: ["sh", "-c", "cp -r /machine-validation /forge-boot-artifacts/blobs/internal"]
   #@overlay/match missing_ok=True
   env:

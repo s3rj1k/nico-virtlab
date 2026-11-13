@@ -23,6 +23,11 @@ if [[ -z "$NICO_TOP" || "$NICO_TOP" != "$(cd "$NICO_ROOT" 2>/dev/null && pwd -P)
   exit 1
 fi
 
+# Data values the overlays read, declared with defaults in values.yaml. Only what
+# the caller sets in the environment overrides them.
+YTT_VALUES=(-f "$SCRIPT_DIR/values.yaml")
+[[ -n "${NICO_IMAGE_REGISTRY:-}" ]] && YTT_VALUES+=(--data-value "image_registry=${NICO_IMAGE_REGISTRY}")
+
 DRY_RUN=false
 REVERSE=false
 FUZZ=false
@@ -138,7 +143,7 @@ apply_ytt() {
     git checkout HEAD -- "$target"; echo "  restore $name -> $target"; applied=$((applied + 1)); return
   fi
   # Regenerate the target from its committed version + overlay (idempotent).
-  if ! git show "HEAD:$target" | ytt -f - -f "$o" >"${target}.labtmp" 2>/dev/null; then
+  if ! git show "HEAD:$target" | ytt -f - -f "$o" "${YTT_VALUES[@]}" >"${target}.labtmp" 2>/dev/null; then
     rm -f "${target}.labtmp"
     echo "  FAIL    $name (ytt overlay did not apply to $target)"; failed=$((failed + 1)); return
   fi

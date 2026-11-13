@@ -354,7 +354,7 @@ fi
 if [[ -n "$USER_DATA" ]]; then
   # Every host nic, not just the primary. The override is keyed on the interface and
   # the api picks it from the source ip, so the other port would find no override.
-  mapfile -t BOOT_IFACES < <(jqa ".machines[] | select(.id == \"$MACHINE_ID\") | .interfaces[] | select(.is_bmc == false) | .id" machine show)
+  mapfile -t BOOT_IFACES < <(jqa ".machines[] | select(.id == \"$MACHINE_ID\") | (.status.interfaces // .interfaces // [])[] | select(.is_bmc == false) | .id" machine show)
   # jqa hides every failure, so an empty list can also mean the filter stopped matching.
   # Provisioning on into the discovery template wastes a full install, so stop here.
   if ((${#BOOT_IFACES[@]} == 0)) || [[ -z "${BOOT_IFACES[0]}" ]]; then
@@ -427,7 +427,7 @@ if [[ "$state" != "assigned/ready" ]]; then
   exit 1
 fi
 
-ADDRESSES=$(jqa ".machines[] | select(.id == \"$MACHINE_ID\") | .interfaces[] | select(.is_bmc == false) | .address[]?" machine show | paste -sd, -)
+ADDRESSES=$(jqa ".machines[] | select(.id == \"$MACHINE_ID\") | (.status.interfaces // .interfaces // [])[] | select(.is_bmc == false) | .address[]?" machine show | paste -sd, -)
 
 cat <<EOF
 

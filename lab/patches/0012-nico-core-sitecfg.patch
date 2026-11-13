@@ -1,5 +1,5 @@
 diff --git a/helm-prereqs/values/nico-core.yaml b/helm-prereqs/values/nico-core.yaml
-index 070d005a1..b15c9a768 100644
+index 198302a34..1d3dd8cef 100644
 --- a/helm-prereqs/values/nico-core.yaml
 +++ b/helm-prereqs/values/nico-core.yaml
 @@ -37,10 +37,14 @@ nico-api:
@@ -21,16 +21,19 @@ index 070d005a1..b15c9a768 100644
  
        # -----------------------------------------------------------------------
        # DHCP servers reachable from this site — REQUIRED: your nico-dhcp VIP(s).
-@@ -59,15 +63,25 @@ nico-api:
-       # site_fabric_prefixes: prefixes that ARE part of the site fabric.
+@@ -66,9 +70,9 @@ nico-api:
+       # these routes or require coverage.
        # deny_prefixes: prefixes instances must NOT reach (OOB, ctrl-plane, underlay).
        # -----------------------------------------------------------------------
 -      site_fabric_prefixes = []                  # REQUIRED: your fabric CIDR(s)
--      deny_prefixes = []                         # your OOB / control-plane / underlay CIDRs
 +      site_fabric_prefixes = ["192.168.42.0/24"] # 2nd-NIC L2 (HostInband segment lives here)
+       # site_fabric_null_routes = []             # OPTIONAL: see coverage requirement above
+-      deny_prefixes = []                         # your OOB / control-plane / underlay CIDRs
 +      deny_prefixes = ["10.42.71.0/24"]          # OOB net, the sushy BMC lives here
  
        # -----------------------------------------------------------------------
+       # FNN related configuration
+@@ -82,8 +86,18 @@ nico-api:
        # Site explorer — periodic background scan of site inventory
        # -----------------------------------------------------------------------
        [site_explorer]
@@ -49,10 +52,10 @@ index 070d005a1..b15c9a768 100644
        # -----------------------------------------------------------------------
        # Machine + BOM validation
        # -----------------------------------------------------------------------
-@@ -84,15 +98,15 @@ nico-api:
-       # -----------------------------------------------------------------------
+@@ -104,15 +118,15 @@ nico-api:
        [pools.lo-ip]
        type = "ipv4"
+       # One address per machine, hosts and DPUs alike: size for hosts x (1 + DPUs per host).
 -      ranges = []                                # REQUIRED: e.g. [{ start = "...", end = "..." }]
 +      ranges = [{ start = "10.255.0.1", end = "10.255.0.254" }]   # dev loopbacks, off the 192.168.42.0/24 bridge
  
@@ -68,7 +71,7 @@ index 070d005a1..b15c9a768 100644
  
        [pools.vpc-vni]
        type = "integer"
-@@ -100,7 +114,7 @@ nico-api:
+@@ -120,7 +134,7 @@ nico-api:
        # must match the config on your FNN gateways and must NOT be expanded without coordinating
        # with your network team. The range must also NOT include the fixed admin_vpc vpc_vni
        # value set in [fnn.admin_vpc] below. Example for non-FNN: [{ start = "0", end = "100" }]
@@ -77,7 +80,7 @@ index 070d005a1..b15c9a768 100644
  
        # -----------------------------------------------------------------------
        # Networks — named L3 segments visible to nico-api.
-@@ -120,6 +134,19 @@ nico-api:
+@@ -140,6 +154,19 @@ nico-api:
        #   mtu = 1500
        #   reserve_first = 2
        # -----------------------------------------------------------------------
@@ -97,7 +100,7 @@ index 070d005a1..b15c9a768 100644
  
        # -----------------------------------------------------------------------
        # InfiniBand (disabled unless your site has an IB fabric)
-@@ -159,7 +186,7 @@ nico-api:
+@@ -170,7 +197,7 @@ nico-api:
  
  
        [fnn.admin_vpc]

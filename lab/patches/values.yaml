@@ -1,0 +1,5 @@
+#@data/values-schema
+---
+#! Values the ytt overlays here can read. apply.sh sets image_registry from
+#! NICO_IMAGE_REGISTRY (registry host plus namespace, as lab.env exports it).
+image_registry: oci.s3rj1k.fyi/nv

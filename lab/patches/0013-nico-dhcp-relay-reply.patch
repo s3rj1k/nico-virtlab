@@ -1,10 +1,10 @@
 diff --git a/helm/charts/nico-dhcp/templates/external-service.yaml b/helm/charts/nico-dhcp/templates/external-service.yaml
-index 8632651bf..4b7c7eeb7 100644
+index d3412bb81..961436f0b 100644
 --- a/helm/charts/nico-dhcp/templates/external-service.yaml
 +++ b/helm/charts/nico-dhcp/templates/external-service.yaml
-@@ -12,6 +12,9 @@ metadata:
-   {{- end }}
- spec:
+@@ -14,6 +14,9 @@ spec:
+   ipFamilyPolicy: SingleStack
+   ipFamilies: [IPv4]
    type: {{ .Values.externalService.type | default "LoadBalancer" }}
 +  {{- if .Values.externalService.externalTrafficPolicy }}
 +  externalTrafficPolicy: {{ .Values.externalService.externalTrafficPolicy }}
@@ -13,10 +13,10 @@ index 8632651bf..4b7c7eeb7 100644
    selector:
      {{- include "nico-dhcp.selectorLabels" . | nindent 4 }}
 diff --git a/helm/charts/nico-dhcp/values.yaml b/helm/charts/nico-dhcp/values.yaml
-index 71ff522df..aed7f3341 100644
+index 9003cfa59..06a5855bf 100644
 --- a/helm/charts/nico-dhcp/values.yaml
 +++ b/helm/charts/nico-dhcp/values.yaml
-@@ -226,4 +226,7 @@ serviceMonitor:
+@@ -277,4 +277,7 @@ serviceMonitor:
  externalService:
    enabled: false
    type: LoadBalancer

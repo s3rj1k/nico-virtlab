@@ -17,5 +17,8 @@ apply.sh -f     # patches only: retry with --fuzz
 apply.sh <file> # just one
 ```
 
+Overlays can read data values declared in `values.yaml`. `image_registry` comes from
+`NICO_IMAGE_REGISTRY` when set, so overlays name the same registry the build pushes to.
+
 Overlays regenerate their target from HEAD each run (idempotent). A file can use both:
 ytt first, then a patch cut against its output.

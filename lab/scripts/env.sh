@@ -7,6 +7,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${LAB_ENV:-${HERE}/lab.env}"
 
+# Optional, gitignored registry settings and pull credentials. Loaded first so the
+# registry below follows it, and wired into .local_envrc so setup.sh sees the creds.
+REGISTRY_ENV="${REGISTRY_ENV:-$(cd "${HERE}/.." && pwd)/registry.env}"
+# shellcheck disable=SC1090
+[[ -f "$REGISTRY_ENV" ]] && source "$REGISTRY_ENV"
+
 # Static defaults (override by exporting before running).
 REGISTRY="${REGISTRY:-oci.s3rj1k.fyi}"
 # Subfolder the build publishes under so images are not at the registry root.
@@ -83,9 +89,15 @@ BLANKS=()
 # run direnv reload after.
 VIRTLAB_ROOT="$(git -C "${HERE}" rev-parse --show-toplevel)"
 NICO_ROOT="${NICO_ROOT:-${VIRTLAB_ROOT}/infra-controller}"
-SRC_LINE="source ${OUT}"
-if ! grep -qxF "${SRC_LINE}" "${NICO_ROOT}/.local_envrc" 2>/dev/null; then
-  printf '%s\n' "${SRC_LINE}" >> "${NICO_ROOT}/.local_envrc"
-  echo "wired ${OUT} into ${NICO_ROOT}/.local_envrc"
-fi
+# registry.env goes first so the registry baked into lab.env wins over a later edit.
+SRC_FILES=()
+[[ -f "$REGISTRY_ENV" ]] && SRC_FILES+=("$REGISTRY_ENV")
+SRC_FILES+=("$OUT")
+for f in "${SRC_FILES[@]}"; do
+  SRC_LINE="source ${f}"
+  if ! grep -qxF "${SRC_LINE}" "${NICO_ROOT}/.local_envrc" 2>/dev/null; then
+    printf '%s\n' "${SRC_LINE}" >> "${NICO_ROOT}/.local_envrc"
+    echo "wired ${f} into ${NICO_ROOT}/.local_envrc"
+  fi
+done
 echo "run 'direnv reload' to expose the vars in this shell"

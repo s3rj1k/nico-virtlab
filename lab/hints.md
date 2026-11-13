@@ -14,13 +14,13 @@ Needs passwordless sudo.
 1. Provision from `lab/heat/lab-stack.yaml`.
 2. `git clone --recurse-submodules git@github.com:s3rj1k/nico-virtlab.git`
 3. `make -C infra-controller bootstrap`
-4. `sg docker -c 'docker login oci.s3rj1k.fyi'`
+4. `sg docker -c 'docker login oci.s3rj1k.fyi'`, or your own registry, see below
 5. `ansible-playbook lab/ansible/build.yml -K`
 6. `ansible-playbook -i lab/ansible/inventory.yml lab/ansible/mgmt.yaml`
 7. `ansible-playbook -i lab/ansible/inventory.yml lab/ansible/worker.yaml`
 8. `cd infra-controller`
 9. `../lab/scripts/env.sh`, then `direnv reload`
-10. `helm-prereqs/setup.sh --skip-dpf`
+10. `helm-prereqs/setup.sh --skip-dpf --skip-rms`
 11. `../lab/scripts/register.sh`, then `../lab/scripts/provision-instance.sh`
 
 - No `--recurse-submodules`? `git submodule update --init` before step 3.
@@ -28,6 +28,13 @@ Needs passwordless sudo.
   `WIP: lab patches (build)` on a detached HEAD — the stamped `VERSION`. The next run resets
   it, so the pin never moves. `-e nico_sync_submodule=false` builds the tree as it stands.
 - Step 6 writes the admin kubeconfig to `~/.kube/config` on builder.
+- Images go to `oci.s3rj1k.fyi/nv`. To use another registry, export `REGISTRY` (host)
+  and `IMAGE_NAMESPACE` (path under it) before step 4 and keep them set for steps 5 and 9.
+  `build.yml`, `env.sh` and the `apply.sh` overlays all follow them. Keep them in the
+  gitignored `lab/registry.env` (with `REGISTRY_USER` / `REGISTRY_TOKEN` for the login)
+  and `source` it first. `env.sh` loads it too and wires it into `.local_envrc`. With
+  `REGISTRY_PULL_SECRET` set (`registry.env` maps it from `REGISTRY_TOKEN`), `setup.sh`
+  creates the pull secrets and 0011 points core workloads at `imagepullsecret`.
 - Inventory IPs default to the heat params; override with `MGMT_IP` / `WORKER_IP`, not `-e`.
 - Step 9 wires `lab/scripts/lab.env` into `infra-controller/.local_envrc`, read by `.envrc`
   and `setup.sh`. Only a shell there has the vars.
@@ -45,7 +52,7 @@ git add infra-controller
 
 ```bash
 lab/scripts/admin-cli.sh machine show
-lab/scripts/admin-cli.sh machine show -f json
+lab/scripts/admin-cli.sh -f json machine show
 lab/scripts/admin-cli.sh vpc show
 lab/scripts/admin-cli.sh network-segment show
 ```

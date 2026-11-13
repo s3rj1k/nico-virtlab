@@ -1,13 +1,14 @@
 diff --git a/helm/charts/nico-pxe/templates/deployment.yaml b/helm/charts/nico-pxe/templates/deployment.yaml
-index de93efa70..ae9ccbf2f 100644
+index c49e78155..a7762785d 100644
 --- a/helm/charts/nico-pxe/templates/deployment.yaml
 +++ b/helm/charts/nico-pxe/templates/deployment.yaml
-@@ -42,7 +42,7 @@ spec:
+@@ -45,7 +45,8 @@ spec:
        initContainers:
-         {{- range .Values.bootArtifactContainers }}
+         {{- range $index, $container := .Values.bootArtifactContainers }}
          - name: {{ .name }}
--          image: {{ if and .repository .tag }}{{ .repository }}:{{ .tag }}{{ else }}{{ .image }}{{ end }}
-+          image: {{ if .repository }}{{ .repository }}:{{ .tag | default $.Values.global.image.tag }}{{ else }}{{ .image }}{{ end }}
+-          image: {{ include "nico.containerImage" (dict "container" $container "path" (printf "%s.bootArtifactContainers[%d]" $.Chart.Name $index)) | quote }}
++          {{- $c := merge (deepCopy $container) (dict "tag" $.Values.global.image.tag) }}
++          image: {{ include "nico.containerImage" (dict "container" $c "path" (printf "%s.bootArtifactContainers[%d]" $.Chart.Name $index)) | quote }}
            {{- with .command }}
            command:
              {{- toYaml . | nindent 12 }}

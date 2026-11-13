@@ -1,8 +1,8 @@
 diff --git a/helm-prereqs/setup.sh b/helm-prereqs/setup.sh
-index 9547a17d7..095358874 100755
+index 7205a2dd1..5b91b91c7 100755
 --- a/helm-prereqs/setup.sh
 +++ b/helm-prereqs/setup.sh
-@@ -135,9 +135,9 @@ set -euo pipefail
+@@ -186,9 +186,9 @@ unset _BMC_V0_CAPTURE_RESTORE_XTRACE
  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  cd "${SCRIPT_DIR}"
  
@@ -12,10 +12,10 @@ index 9547a17d7..095358874 100755
 +AUTO_YES="${AUTO_YES:-true}"
 +SKIP_CORE="${SKIP_CORE:-false}"
 +SKIP_REST="${SKIP_REST:-false}"
- SKIP_FLOW=false
  # DPF (DOCA Platform Framework) DPU provisioning installs by DEFAULT. Opt out
  # with --skip-dpf or NICO_SKIP_DPF=true (e.g. sites with no DPUs, or that still
-@@ -1267,7 +1267,7 @@ else
+ # use the deprecated iPXE DPU path). NICO_INSTALL_DPF=false is honored too.
+@@ -1802,7 +1802,7 @@ else
          -f "${_CORE_VALUES_ARG}"
          --set-string "global.image.repository=${NICO_IMAGE_REGISTRY}/nvmetal-carbide"
          --set-string "global.image.tag=${NICO_CORE_IMAGE_TAG}"
